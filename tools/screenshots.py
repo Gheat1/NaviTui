@@ -63,20 +63,28 @@ PALETTES = [
 
 
 def make_cover(index: int, path: Path) -> None:
-    """A little generative gradient cover so every album looks distinct."""
+    """A generative cover per album: smooth diagonal gradient with one big
+    soft disc. Deliberately low-frequency — fine detail just aliases into
+    noise at half-cell resolution."""
     (c1, c2) = PALETTES[index % len(PALETTES)]
-    size = 400
+    size = 800
     img = Image.new("RGB", (size, size))
+    px = img.load()
+    cx, cy = size * 0.62, size * 0.40
+    max_d = size * 0.55
     for y in range(size):
-        t = y / size
-        row = tuple(round(a + (b - a) * t) for a, b in zip(c1, c2))
-        img.paste(row, (0, y, size, y + 1))
+        for x in range(0, size, 4):  # 4px columns keep this fast
+            t = (x + y) / (2 * size)
+            base = [a + (b - a) * t for a, b in zip(c1, c2)]
+            d = math.hypot(x - cx, y - cy) / max_d
+            glow = max(0.0, 1.0 - d) ** 2 * 0.55
+            col = tuple(round(v + (250 - v) * glow) for v in base)
+            for dx in range(4):
+                if x + dx < size:
+                    px[x + dx, y] = col
     draw = ImageDraw.Draw(img)
-    cx, cy = size // 2, size // 2
-    for r in range(160, 20, -28):
-        shade = tuple(max(0, v - r // 2) for v in (c2 if r % 56 else c1))
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=shade, width=6)
-    draw.ellipse((cx - 18, cy - 18, cx + 18, cy + 18), fill=(30, 30, 46))
+    r = size * 0.045
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(30, 30, 46))
     img.save(path, "PNG")
 
 
@@ -195,14 +203,17 @@ class FakeClient:
     async def set_star(self, item_id, kind, star):
         pass
 
+    async def get_all_songs(self, max_songs=5000):
+        return [s for songs in self.songs.values() for s in songs][:max_songs]
+
     def stream_url(self, song_id):
         return str(self._tone)
 
-    def cached_art(self, cover_id, size=600):
-        return self._art_dir / f"{cover_id}-{size}"
+    def cached_art(self, cover_id, size=1200):
+        return self._art_dir / f"{cover_id}-600"  # one size fits the fake
 
-    async def cover_art(self, cover_id, size=600):
-        return self._art_dir / f"{cover_id}-{size}"
+    async def cover_art(self, cover_id, size=1200):
+        return self._art_dir / f"{cover_id}-600"
 
     async def close(self):
         pass

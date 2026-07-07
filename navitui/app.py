@@ -9,6 +9,7 @@ progress pulse, marquee, spinners); each tick repaints only a few cells.
 from __future__ import annotations
 
 import asyncio
+import random
 
 from rich.text import Text
 from textual import on, work
@@ -38,8 +39,12 @@ ALBUM_VIEWS = [
     ("frequent", "most played"),
     ("random", "random albums"),
     ("alphabeticalByName", "all albums"),
+    ("all-songs", "all tracks"),
     ("random-songs", "surprise me"),
+    ("shuffle-all", "shuffle everything"),
 ]
+
+SONG_VIEWS = {"all-songs", "random-songs", "shuffle-all"}
 
 HELP_SECTIONS = [
     (
@@ -482,6 +487,23 @@ class NaviTuiApp(KitApp):
             self._fill("#pane2-list", [])
             self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
             return
+        if view in ("all-songs", "shuffle-all"):
+            cached = self.dirs.read_cache("all-songs")
+            if cached:
+                self._songs = [Song.from_dict(s) for s in cached.get("songs", [])]
+                self._fill("#pane2-list", [])
+                self._fill("#pane3-list", [self._song_row(s) for s in self._songs], "#pane3-panel")
+            try:
+                songs = await self.client.get_all_songs()
+            except Exception as e:
+                self._connection_trouble(e)
+                return
+            self.dirs.write_cache("all-songs", {"songs": [s.to_dict() for s in songs]})
+            if self.tab == "albums":
+                self._songs = songs
+                self._fill("#pane2-list", [])
+                self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
+            return
         key = f"albumlist-{view}"
         cached = None if view == "random" else self.dirs.read_cache(key)
         if cached:
@@ -591,8 +613,23 @@ class NaviTuiApp(KitApp):
                 self._play_songs(self._songs, 0)
         elif self.tab == "starred":
             pass
+        elif self.tab == "albums" and event.option.id == "shuffle-all":
+            self._shuffle_everything()
+        elif self.tab == "albums" and event.option.id in SONG_VIEWS:
+            self.query_one("#pane3-list", NavList).focus()
         else:
             self.query_one("#pane2-list", NavList).focus()
+
+    def _shuffle_everything(self) -> None:
+        if not self._songs:
+            self.notify("still fetching the library — try again in a second", timeout=3)
+            return
+        if not self.queue.shuffle:
+            self.queue.shuffle = True
+            self.query_one("#now", NowPlaying).shuffle = True
+            self.dirs.save_state({"shuffle": True})
+        self._play_songs(self._songs, random.randrange(len(self._songs)))
+        self.notify(f"shuffling all {len(self._songs)} tracks", timeout=3)
 
     @on(OptionList.OptionHighlighted, "#pane2-list")
     def _pane2_highlighted(self, event: OptionList.OptionHighlighted) -> None:

@@ -16,8 +16,9 @@ via [ricekit](https://github.com/Gheat1/ricekit) — and everything moves.
 ## what it does
 
 - **the whole library** — artists → albums → tracks, album views (recently
-  added / played / most played / random / all), playlists, starred, and a
-  fuzzy-ish global search over everything (`/`)
+  added / played / most played / random / all), a flat **all tracks** list,
+  **shuffle everything**, playlists, starred, and a global search over
+  everything (`/`)
 - **real cover art** — kitty graphics protocol or sixel where available,
   truecolor half-cells everywhere else (`NAVITUI_ART=auto|tgp|sixel|halfcell|unicode|off`)
 - **a queue that behaves** — add (`a`), play-next (`A`), remove, clear,

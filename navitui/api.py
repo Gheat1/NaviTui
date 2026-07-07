@@ -136,6 +136,26 @@ class SubsonicClient:
         body = await self._get("getRandomSongs", size=size)
         return [Song.from_api(s) for s in body.get("randomSongs", {}).get("song", [])]
 
+    async def get_all_songs(self, max_songs: int = 5000) -> list[Song]:
+        """Every song in the library, paged through search3 with the empty
+        query (the Navidrome/OpenSubsonic 'list everything' convention)."""
+        songs: list[Song] = []
+        page = 500
+        while len(songs) < max_songs:
+            body = await self._get(
+                "search3",
+                query='""',
+                artistCount=0,
+                albumCount=0,
+                songCount=page,
+                songOffset=len(songs),
+            )
+            batch = body.get("searchResult3", {}).get("song", [])
+            songs.extend(Song.from_api(s) for s in batch)
+            if len(batch) < page:
+                break
+        return songs[:max_songs]
+
     # ── playback side-channel ─────────────────────────────────────────
     def stream_url(self, song_id: str) -> str:
         params = "&".join(f"{k}={v}" for k, v in self._params(id=song_id).items())
@@ -150,11 +170,13 @@ class SubsonicClient:
         await self._get("star" if star else "unstar", **{key: item_id})
 
     # ── cover art ─────────────────────────────────────────────────────
-    def cached_art(self, cover_id: str, size: int = 600) -> Path | None:
+    # 1200px: big enough that kitty/sixel terminals get a crisp image at
+    # any panel size; halfcell terminals are bounded by cells either way
+    def cached_art(self, cover_id: str, size: int = 1200) -> Path | None:
         path = self._art_dir / f"{cover_id.replace('/', '_')}-{size}"
         return path if path.exists() else None
 
-    async def cover_art(self, cover_id: str, size: int = 600) -> Path:
+    async def cover_art(self, cover_id: str, size: int = 1200) -> Path:
         path = self._art_dir / f"{cover_id.replace('/', '_')}-{size}"
         if path.exists():
             return path

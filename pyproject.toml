@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "navitui"
-version = "0.1.0"
+version = "0.2.0"
 description = "A fast, animated TUI player for Navidrome — cover art in the terminal, playback via mpv, themes via ricekit"
 readme = "README.md"
 license = { text = "MIT" }
