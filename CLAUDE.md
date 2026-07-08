@@ -37,17 +37,17 @@ Design priorities, in order:
 ## file map
 
 ```
-navitui/app.py        the app: layout, tabs, workers, playback glue, actions
+navitui/app.py        the app: sidebar+tracks layout, workers, playback glue, actions
 navitui/api.py        async Subsonic client (httpx), token auth, art cache
 navitui/player.py     libmpv wrapper + NullPlayer fallback when mpv is absent
 navitui/playqueue.py  queue/shuffle/repeat logic (no UI in here)
 navitui/anim.py       animation primitives: shimmer, smooth_bar, marquee, viz
 navitui/widgets.py    Logo, Visualizer, NowPlaying (the animated transport)
 navitui/art.py        CoverArt widget, protocol picking, NAVITUI_ART override
-navitui/screens.py    onboarding (validates live, stores chmod 600) + search
+navitui/screens.py    onboarding, search modal, InputModal (playlist names)
 navitui/models.py     dataclasses that round-trip through the JSON cache
 tools/screenshots.py  headless SVG screenshot generator + FakeClient
-tools/demo.py         poses the real app in a real terminal (states: main/albums/search/void)
+tools/demo.py         poses the real app in a real terminal (states: main/playlist/search/void)
 tools/shots.sh        captures those states with grim → assets/shot-*.png
 ```
 

@@ -14,6 +14,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from ricekit import icons, palette
+from ricekit.widgets import NavList
 
 from navitui import anim
 from navitui.models import Song
@@ -23,6 +24,18 @@ SHUFFLE_ICON = "\uf074"  # nf-fa-random
 REPEAT_ICON = "\uf01e"  # nf-fa-repeat
 PLAY_GLYPH = "\uf04b"  # nf-fa-play
 PAUSE_GLYPH = "\uf04c"  # nf-fa-pause
+
+
+class ClickList(NavList):
+    """Single click highlights (previews), double click selects (acts).
+    Keyboard enter still selects instantly — only the mouse path changes."""
+
+    async def _on_click(self, event) -> None:
+        clicked = event.style.meta.get("option")
+        if clicked is not None and not self._options[clicked].disabled:
+            self.highlighted = clicked
+            if getattr(event, "chain", 1) >= 2:
+                self.action_select()
 
 
 class Logo(Static):

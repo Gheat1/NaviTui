@@ -39,6 +39,6 @@ for c in json.load(sys.stdin):
 }
 
 shot main   16
-shot albums 16
+shot playlist 16
 shot search 16
 shot void   16

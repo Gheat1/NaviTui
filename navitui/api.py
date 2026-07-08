@@ -10,6 +10,7 @@ for anything you've already looked at renders instantly and offline.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 from pathlib import Path
@@ -104,6 +105,12 @@ class SubsonicClient:
         body = await self._get("getPlaylists")
         return [Playlist.from_api(p) for p in body.get("playlists", {}).get("playlist", [])]
 
+    async def create_playlist(self, name: str, song_ids: list[str]) -> None:
+        await self._get("createPlaylist", name=name, songId=song_ids)
+
+    async def add_to_playlist(self, playlist_id: str, song_ids: list[str]) -> None:
+        await self._get("updatePlaylist", playlistId=playlist_id, songIdToAdd=song_ids)
+
     async def get_playlist_songs(self, playlist_id: str) -> list[Song]:
         body = await self._get("getPlaylist", id=playlist_id)
         return [Song.from_api(s) for s in body.get("playlist", {}).get("entry", [])]
@@ -135,6 +142,20 @@ class SubsonicClient:
     async def get_random_songs(self, size: int = 50) -> list[Song]:
         body = await self._get("getRandomSongs", size=size)
         return [Song.from_api(s) for s in body.get("randomSongs", {}).get("song", [])]
+
+    async def get_songs_by_albums(self, list_type: str, albums: int = 15) -> list[Song]:
+        """Songs-first view of an album list: flatten the songs of the top N
+        albums for `newest` / `recent` / `frequent`, keeping album order."""
+        album_list = await self.get_album_list(list_type, size=albums)
+        results = await asyncio.gather(
+            *(self.get_album_songs(a.id) for a in album_list),
+            return_exceptions=True,
+        )
+        songs: list[Song] = []
+        for result in results:
+            if isinstance(result, list):
+                songs.extend(result)
+        return songs
 
     async def get_all_songs(self, max_songs: int = 5000) -> list[Song]:
         """Every song in the library, paged through search3 with the empty

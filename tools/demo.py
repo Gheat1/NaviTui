@@ -64,20 +64,13 @@ class DemoApp(NaviTuiApp):
 
     async def _drive(self) -> None:
         state = self._demo_state
-        await asyncio.sleep(1.2)  # library cascade settles
-        pane1 = self.query_one("#pane1-list")
-        pane1.focus()
-        pane1.highlighted = 0
-        await asyncio.sleep(1.0)  # albums + tracks + art load
+        await asyncio.sleep(1.5)  # sidebar + all-tracks view settle
 
-        # start playback on track 3, then top the queue up with more albums
+        # start playback on track 3 of the all-tracks view, seek mid-song
         self._play_songs(self._songs, 2)
-        songs2 = await self.client.get_album_songs("al2")
-        songs3 = await self.client.get_album_songs("al4")
-        self.queue.add(songs2 + songs3[:3])
-        self._render_queue()
         await asyncio.sleep(2.0)  # mpv buffers, duration lands
-        self.player.seek_to(0.44)  # mid-song: bar filled, times look real
+        self.player.seek_to(0.44)
+        self.query_one("#tracks-list").focus()
 
         # terminal query responses can leak a stray key during startup and
         # open a modal; make sure we're photographing the base screen
@@ -86,14 +79,11 @@ class DemoApp(NaviTuiApp):
 
         if state == "void":
             self.theme = "void"
-        elif state == "albums":
-            self.action_set_tab("albums")
-            await asyncio.sleep(0.6)
-            p1 = self.query_one("#pane1-list")
-            p1.focus()
-            p1.highlighted = 5  # "all tracks"
+        elif state == "playlist":
+            sidebar = self.query_one("#sidebar-list")
+            sidebar.focus()
+            self._highlight_view(f"pl:{(await self.client.get_playlists())[0].id}")
             await asyncio.sleep(0.8)
-            self.query_one("#pane3-list").focus()
         elif state == "search":
             self.push_screen(SearchModal())
             await asyncio.sleep(0.4)

@@ -163,16 +163,59 @@ class OnboardingScreen(Screen):
         self.app.exit()
 
 
+class InputModal(ModalScreen):
+    """One-line text prompt (e.g. a new playlist name). Dismisses with the
+    entered string, or None on escape."""
+
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    DEFAULT_CSS = """
+    InputModal { align: center middle; background: $kit-overlay; }
+    InputModal #input-box {
+        width: 52; height: auto;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    InputModal Static { background: $kit-modal-bg; }
+    InputModal Input { background: transparent; border: round $kit-border; }
+    InputModal Input:focus { border: round $kit-border-focus; }
+    """
+
+    def __init__(self, title: str, placeholder: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="input-box"):
+            yield Static(Text(self._title, style=f"bold {palette.sub}"))
+            yield Input(placeholder=self._placeholder, id="input-value")
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#input-box"))
+        settle_pop_in(self, "#input-box")
+        self.query_one("#input-value", Input).focus()
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        self.dismiss(value or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SearchModal(ModalScreen):
     """Global search over artists, albums and songs — debounced, grouped.
 
-    Dismisses with ("song", songs, index) | ("album", album) |
-    ("artist", artist) | None.
+    Dismisses with ("song", songs, index) | ("song-queue", song, play_next)
+    | ("album", album) | ("artist", artist) | None.
     """
 
     BINDINGS = [
         Binding("escape", "cancel", show=False),
         Binding("down", "to_list", show=False),
+        Binding("a", "queue_song(False)", show=False),
+        Binding("A", "queue_song(True)", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -187,6 +230,7 @@ class SearchModal(ModalScreen):
         height: auto; max-height: 24;
         text-wrap: nowrap; text-overflow: ellipsis;
     }
+    SearchModal #search-hint { padding: 1 1 0 1; }
     """
 
     def __init__(self) -> None:
@@ -197,6 +241,31 @@ class SearchModal(ModalScreen):
         with Vertical(id="search-box"):
             yield Input(placeholder="search the library", id="search-input")
             yield NavList(id="search-results")
+            yield Static(self._hint(), id="search-hint")
+
+    def _hint(self) -> Text:
+        t = Text()
+        for key, desc in (("enter", "play"), ("a", "queue"), ("A", "play next"), ("esc", "close")):
+            if key != "enter":
+                t.append("  ·  ", style=palette.vfaint)
+            t.append(key, style=palette.blue)
+            t.append(f" {desc}", style=palette.dim)
+        return t
+
+    def _highlighted_song(self):
+        """The Song under the results cursor, or None."""
+        ol = self.query_one("#search-results", NavList)
+        if ol.highlighted is None:
+            return None
+        option = ol.get_option_at_index(ol.highlighted)
+        if option.id and option.id.startswith("song:"):
+            return self._results.songs[int(option.id.split(":", 1)[1])]
+        return None
+
+    def action_queue_song(self, play_next: bool) -> None:
+        song = self._highlighted_song()
+        if song is not None:
+            self.dismiss(("song-queue", song, play_next))
 
     def on_mount(self) -> None:
         pop_in(self.query_one("#search-box"))

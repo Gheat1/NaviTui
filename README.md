@@ -15,13 +15,19 @@ via [ricekit](https://github.com/Gheat1/ricekit) — and everything moves.
 
 ## what it does
 
-- **the whole library** — artists → albums → tracks, album views (recently
-  added / played / most played / random / all), a flat **all tracks** list,
-  **shuffle everything**, playlists, starred, and a global search over
-  everything (`/`)
+- **songs first** — no album grids to dig through: one sidebar with all
+  tracks / recently added / recently played / most played / starred /
+  **shuffle everything**, your playlists right under it, and one big track
+  list. Albums and artists still exist — inside search (`/`), where they
+  belong
+- **playlists you can actually edit** — create one from the sidebar, add
+  any track with `p`
+- **search that queues** — `enter` plays, `a` queues, `A` slots it right
+  after the current song
 - **real cover art** — kitty graphics protocol or sixel where available,
   truecolor half-cells everywhere else (`NAVITUI_ART=auto|tgp|sixel|halfcell|unicode|off`)
-- **a queue that behaves** — add (`a`), play-next (`A`), remove, clear,
+- **a queue that behaves** — shows what's *up next* (played tracks dim out
+  above; scroll up for history), add (`a`), play-next (`A`), remove, clear,
   shuffle that keeps the current track, repeat off/all/one; the queue —
   including your position *inside the current song* — survives a restart
 - **alive by default** — the wordmark shimmers, the visualizer pulses with
@@ -76,13 +82,14 @@ Subsonic-compatible server. Try it against the public demo:
 | | |
 | --- | --- |
 | `space` | play / pause |
-| `enter` | play track / album / playlist |
+| `enter` / double-click | play (track, view, playlist) |
 | `n` / `b` | next / previous |
 | `←` `→` | seek (`shift` for 30s) |
-| `a` / `A` | queue / play next |
+| `a` / `A` | queue / play next (works in search too) |
+| `p` | add track to a playlist |
 | `s` / `r` | shuffle / repeat |
+| `f` | star / unstar |
 | `/` | search |
-| `1`–`4` | library · albums · playlists · starred |
 | `h` `l` `j` `k` | move around, vim-style |
 | `t` / `T` | themes |
 

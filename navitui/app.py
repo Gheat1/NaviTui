@@ -1,5 +1,9 @@
 """NaviTui — the app.
 
+Songs-first: one sidebar of ways-to-list-tracks (views + playlists), one big
+tracks pane, cover + queue on the right. No tabs, no album browsing — albums
+and artists only exist inside search.
+
 Cache-first everywhere: every pane renders from the last-known JSON cache
 instantly, then a worker fetches fresh rows and swaps them in silently.
 One 8fps heartbeat drives every animation (logo shimmer, visualizer,
@@ -19,39 +23,34 @@ from textual.widgets import Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ricekit import KitApp, icons, palette
-from ricekit.modals import HelpModal
+from ricekit.modals import HelpModal, PickerModal
 from ricekit.storage import AppDirs
-from ricekit.widgets import NavList, Splitter, pop_in
+from ricekit.widgets import NavList, Splitter
 
 from navitui import anim, player as playermod
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.models import Album, Artist, Playlist, Song
-from navitui.playqueue import PlayQueue, Repeat
-from navitui.screens import OnboardingScreen, SearchModal
-from navitui.widgets import Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
+from navitui.playqueue import PlayQueue
+from navitui.screens import InputModal, OnboardingScreen, SearchModal
+from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
 
-TABS = ["library", "albums", "playlists", "starred"]
-
-ALBUM_VIEWS = [
+VIEWS = [
+    ("all-songs", "all tracks"),
     ("newest", "recently added"),
     ("recent", "recently played"),
     ("frequent", "most played"),
-    ("random", "random albums"),
-    ("alphabeticalByName", "all albums"),
-    ("all-songs", "all tracks"),
-    ("random-songs", "surprise me"),
+    ("starred", "starred"),
     ("shuffle-all", "shuffle everything"),
 ]
-
-SONG_VIEWS = {"all-songs", "random-songs", "shuffle-all"}
+VIEW_LABELS = dict(VIEWS)
 
 HELP_SECTIONS = [
     (
         "playback",
         [
             ("space", "play / pause"),
-            ("enter", "play track / album / playlist"),
+            ("enter / double-click", "play (track, view, playlist)"),
             ("n / b", "next / previous track"),
             ("← / →", "seek 5s   (shift: 30s)"),
             ("- / +", "volume down / up"),
@@ -63,20 +62,21 @@ HELP_SECTIONS = [
     (
         "queue",
         [
-            ("a", "add highlighted to queue"),
-            ("A", "play highlighted next"),
+            ("a", "add track to queue"),
+            ("A", "play track next"),
             ("x", "remove track (in queue panel)"),
             ("X", "clear queue"),
+            ("", "played tracks dim out — scroll up for history"),
         ],
     ),
     (
-        "browse",
+        "library",
         [
-            ("1-4", "library · albums · playlists · starred"),
-            ("h / l", "previous / next panel"),
             ("j / k / g / G", "move in lists"),
-            ("/", "search everything"),
-            ("f", "star / unstar highlighted"),
+            ("h / l", "previous / next panel"),
+            ("/", "search  (enter play · a queue · A play next)"),
+            ("p", "add track to a playlist"),
+            ("f", "star / unstar track"),
             ("R", "refresh from server"),
         ],
     ),
@@ -114,10 +114,7 @@ class NaviTuiApp(KitApp):
         Binding("x", "queue_remove", show=False),
         Binding("X", "queue_clear", show=False),
         Binding("f", "star", show=False),
-        Binding("1", "set_tab('library')", show=False),
-        Binding("2", "set_tab('albums')", show=False),
-        Binding("3", "set_tab('playlists')", show=False),
-        Binding("4", "set_tab('starred')", show=False),
+        Binding("p", "playlist_add", show=False),
         Binding("h", "focus_panel(-1)", show=False),
         Binding("l", "focus_panel(1)", show=False),
         Binding("R", "refresh", show=False),
@@ -129,7 +126,6 @@ class NaviTuiApp(KitApp):
 
     CSS = """
     #topbar { height: 1; padding: 0 1; }
-    #topbar #tabs { width: auto; padding: 0 2; link-style: none; link-color: $text-muted; }
     #topbar #status { width: 1fr; text-align: right; }
 
     #main { height: 1fr; }
@@ -137,16 +133,13 @@ class NaviTuiApp(KitApp):
     .panel { border: round $kit-border; }
     .panel:focus-within { border: round $kit-border-focus; }
     .panel NavList { height: 1fr; }
-    #pane1-panel { width: 26; }
-    #pane2-panel { width: 34; }
-    #pane3-panel { width: 1fr; }
+    #sidebar-panel { width: 26; }
+    #tracks-panel { width: 1fr; }
     #side { width: 36; }
     #art-panel { height: 40%; min-height: 12; border: round $kit-border; }
     #queue-panel { height: 1fr; border: round $kit-border; }
 
     NowPlaying.playing { border: round $kit-border-alt; }
-
-    .hidden { display: none; }
     """
 
     def __init__(self, client: SubsonicClient | None = None, ao: str | None = None) -> None:
@@ -156,40 +149,33 @@ class NaviTuiApp(KitApp):
         self._ao = ao
         self.queue = PlayQueue()
         self.player = None
-        # pane backing data
-        self._artists: list[Artist] = []
-        self._pane1_playlists: list[Playlist] = []
-        self._albums: list[Album] = []
-        self._songs: list[Song] = []
-        self._starred_songs: list[Song] = []
-        self.tab = "library"
+        self.view: str = "all-songs"  # sidebar view id (or "pl:<id>", or "artist:<id>")
+        self._songs: list[Song] = []  # what the tracks pane shows
+        self._playlists: list[Playlist] = []
         # playback bookkeeping
         self._scrobbled = False
         self._end_failures = 0
         self._resume_position = 0.0
         self._mutations = 0
         self._last_persist = 0.0
+        self._queue_scrolled_to = -2
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self):
         with Horizontal(id="topbar"):
             yield Logo(id="logo")
-            yield Static(id="tabs")
             yield Static(id="status")
         with Horizontal(id="main"):
-            with Vertical(id="pane1-panel", classes="panel"):
-                yield NavList(id="pane1-list")
-            yield Splitter("#pane1-panel", on_resized=self._persist_width, id="split1")
-            with Vertical(id="pane2-panel", classes="panel"):
-                yield NavList(id="pane2-list")
-            yield Splitter("#pane2-panel", on_resized=self._persist_width, id="split2")
-            with Vertical(id="pane3-panel", classes="panel"):
-                yield NavList(id="pane3-list")
-            yield Splitter("#side", invert=True, on_resized=self._persist_width, id="split3")
+            with Vertical(id="sidebar-panel", classes="panel"):
+                yield ClickList(id="sidebar-list")
+            yield Splitter("#sidebar-panel", on_resized=self._persist_width, id="split1")
+            with Vertical(id="tracks-panel", classes="panel"):
+                yield ClickList(id="tracks-list")
+            yield Splitter("#side", invert=True, on_resized=self._persist_width, id="split2")
             with Vertical(id="side"):
                 yield CoverArt(id="art-panel")
                 with Vertical(id="queue-panel", classes="panel"):
-                    yield NavList(id="queue-list")
+                    yield ClickList(id="queue-list")
         yield NowPlaying(id="now")
         yield Footer()
 
@@ -204,10 +190,13 @@ class NaviTuiApp(KitApp):
             except Exception:
                 pass
 
+        self.query_one("#sidebar-panel").border_title = "tracks"
+        self.query_one("#tracks-panel").border_title = "tracks"
         self.query_one("#art-panel", CoverArt).border_title = "cover"
         self.query_one("#queue-panel").border_title = "queue"
-        self.tab = state.get("tab", "library")
-        self._render_tabs()
+        saved_view = state.get("view", "all-songs")
+        if saved_view in VIEW_LABELS or saved_view.startswith("pl:"):
+            self.view = saved_view
 
         self.player = playermod.create_player(self._mpv_position, self._mpv_track_end, ao=self._ao)
         self.player.set_volume(int(state.get("volume", 80)))
@@ -266,8 +255,14 @@ class NaviTuiApp(KitApp):
 
     def _start(self) -> None:
         self._render_status()
-        self._show_tab(initial=True)
-        self.query_one("#pane1-list", NavList).focus()
+        cached = self.dirs.read_cache("playlists")
+        if cached:
+            self._playlists = [Playlist.from_dict(p) for p in cached.get("playlists", [])]
+        self._render_sidebar()
+        sidebar = self.query_one("#sidebar-list", ClickList)
+        sidebar.focus()
+        self._highlight_view(self.view)
+        self._load_playlists()
 
     def _render_status(self) -> None:
         if self.client is None:
@@ -289,123 +284,189 @@ class NaviTuiApp(KitApp):
             busy = any(
                 not w.is_finished
                 for w in self.workers
-                if w.group in ("lib", "albums", "songs", "albumlist", "starred")
+                if w.group in ("lib", "songs")
             )
-            pane1 = self.query_one("#pane1-panel")
+            panel = self.query_one("#tracks-panel")
             if busy:
-                pane1.border_subtitle = f"{anim.spinner(int(now._tick))} refreshing"
-            elif pane1.border_subtitle and "refreshing" in pane1.border_subtitle:
-                count = self.query_one("#pane1-list", NavList).option_count
-                pane1.border_subtitle = str(count) if count else None
+                panel.border_subtitle = f"{anim.spinner(int(now._tick))} refreshing"
+            elif panel.border_subtitle and "refreshing" in panel.border_subtitle:
+                count = self.query_one("#tracks-list", NavList).option_count
+                panel.border_subtitle = str(count) if count else None
         except Exception:
             return  # shutdown race: the timer can fire while widgets unmount
 
-    # ── tabs ──────────────────────────────────────────────────────────
+    # ── sidebar ───────────────────────────────────────────────────────
+    def _render_sidebar(self) -> None:
+        ol = self.query_one("#sidebar-list", ClickList)
+        highlighted_id = None
+        if ol.highlighted is not None:
+            highlighted_id = ol.get_option_at_index(ol.highlighted).id
+        options: list[Option] = []
+        options.append(Option(Text(" tracks", style=f"bold {palette.dim}"), disabled=True))
+        for view_id, label in VIEWS:
+            row = Text(no_wrap=True, overflow="ellipsis")
+            glyph, color = ("", palette.peach) if view_id == "shuffle-all" else ("◍", palette.mauve)
+            if view_id == "starred":
+                glyph, color = icons.STAR, palette.yellow
+            row.append(f"{glyph} ", style=color)
+            row.append(label, style=palette.text)
+            options.append(Option(row, id=view_id))
+        options.append(Option(Text(" "), disabled=True))
+        options.append(Option(Text(" playlists", style=f"bold {palette.dim}"), disabled=True))
+        for p in self._playlists:
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append(f"{icons.LIST} ", style=palette.lav)
+            row.append(p.name, style=palette.text)
+            row.append(f" {p.song_count}♪", style=palette.vfaint)
+            options.append(Option(row, id=f"pl:{p.id}"))
+        new_row = Text(no_wrap=True)
+        new_row.append(f"{icons.PLUS} ", style=palette.green)
+        new_row.append("new playlist", style=palette.sub)
+        options.append(Option(new_row, id="pl-new"))
 
-    def _render_tabs(self) -> None:
-        parts = []
-        for name in TABS:
-            if name == self.tab:
-                parts.append(f"[bold {palette.blue}] {name} [/]")
-            else:
-                parts.append(f"[{palette.dim}][@click=app.set_tab('{name}')] {name} [/][/]")
-        self.query_one("#tabs", Static).update("·".join(parts))
+        had_focus = ol.has_focus
+        ol.clear_options()
+        ol.add_options(options)
+        self._highlight_view(highlighted_id or self.view)
+        if had_focus:
+            ol.focus()
 
-    def action_set_tab(self, tab: str) -> None:
-        if tab not in TABS or tab == self.tab:
+    def _highlight_view(self, view_id: str | None) -> None:
+        if not view_id:
             return
-        self.tab = tab
-        self.dirs.save_state({"tab": tab})
-        self._render_tabs()
-        self._show_tab()
+        ol = self.query_one("#sidebar-list", ClickList)
+        for i in range(ol.option_count):
+            if ol.get_option_at_index(i).id == view_id:
+                ol.highlighted = i
+                return
 
-    def _show_tab(self, initial: bool = False) -> None:
-        pane2 = self.query_one("#pane2-panel")
-        split2 = self.query_one("#split2")
-        show_pane2 = self.tab != "playlists"
-        pane2.set_class(not show_pane2, "hidden")
-        split2.set_class(not show_pane2, "hidden")
+    @on(OptionList.OptionHighlighted, "#sidebar-list")
+    def _sidebar_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        oid = event.option.id
+        if not oid or oid == "pl-new":
+            return
+        self.view = oid
+        self.dirs.save_state({"view": oid})
+        self._load_view(oid)
 
-        p1 = self.query_one("#pane1-panel")
-        p2 = self.query_one("#pane2-panel")
-        p3 = self.query_one("#pane3-panel")
-        titles = {
-            "library": ("artists", "albums", "tracks"),
-            "albums": ("views", "albums", "tracks"),
-            "playlists": ("playlists", "", "tracks"),
-            "starred": ("★ artists", "★ albums", "★ tracks"),
-        }[self.tab]
-        p1.border_title, p2.border_title, p3.border_title = titles
-        for panel in (p1, p2, p3):
-            panel.border_subtitle = None
-        pop_in(p1)
-        if show_pane2:
-            pop_in(p2)
-        pop_in(p3)
-
-        self._fill("#pane2-list", [])
-        self._fill("#pane3-list", [])
-        if self.tab == "library":
-            self._load_artists()
-        elif self.tab == "albums":
-            self._fill(
-                "#pane1-list",
-                [self._view_row(vid, label) for vid, label in ALBUM_VIEWS],
+    @on(OptionList.OptionSelected, "#sidebar-list")
+    def _sidebar_selected(self, event: OptionList.OptionSelected) -> None:
+        oid = event.option.id
+        if not oid:
+            return
+        if oid == "pl-new":
+            self.push_screen(
+                InputModal("new playlist", placeholder="name"), self._playlist_created_name
             )
-        elif self.tab == "playlists":
-            self._load_playlists()
-        elif self.tab == "starred":
-            self._load_starred()
-        if not initial:
-            self.query_one("#pane1-list", NavList).focus()
+        elif oid == "shuffle-all":
+            self._shuffle_everything()
+        elif self._songs:
+            # enter on a view or playlist just plays it from the top
+            self._play_songs(self._songs, 0)
+
+    # ── loading songs into the tracks pane ────────────────────────────
+    def _tracks_title(self, view_id: str) -> str:
+        if view_id.startswith("pl:"):
+            pid = view_id.split(":", 1)[1]
+            playlist = next((p for p in self._playlists if p.id == pid), None)
+            return playlist.name if playlist else "playlist"
+        return VIEW_LABELS.get(view_id, "tracks")
+
+    def _show_songs(self, songs: list[Song], title: str) -> None:
+        self._songs = songs
+        panel = self.query_one("#tracks-panel")
+        panel.border_title = title
+        self._fill("#tracks-list", [self._song_row(s) for s in songs], "#tracks-panel")
+
+    @work(exclusive=True, group="songs")
+    async def _load_view(self, view_id: str) -> None:
+        await asyncio.sleep(0.12)  # superseded while the cursor is moving
+        title = self._tracks_title(view_id)
+
+        if view_id in ("all-songs", "shuffle-all"):
+            cache_key, fetch = "all-songs", self.client.get_all_songs
+        elif view_id in ("newest", "recent", "frequent"):
+            cache_key = f"songview-{view_id}"
+
+            async def fetch(v=view_id):
+                return await self.client.get_songs_by_albums(v)
+        elif view_id == "starred":
+            cache_key = "starred-songs"
+
+            async def fetch():
+                return (await self.client.get_starred()).songs
+        elif view_id.startswith("pl:"):
+            pid = view_id.split(":", 1)[1]
+            cache_key = f"playlist-songs-{pid}"
+
+            async def fetch(p=pid):
+                return await self.client.get_playlist_songs(p)
+        else:
+            return
+
+        cached = self.dirs.read_cache(cache_key)
+        if cached:
+            self._show_songs([Song.from_dict(s) for s in cached.get("songs", [])], title)
+        try:
+            songs = await fetch()
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        self.dirs.write_cache(cache_key, {"songs": [s.to_dict() for s in songs]})
+        if self.view == view_id:
+            self._show_songs(songs, title)
+
+    @work(exclusive=True, group="songs")
+    async def _load_artist_songs(self, artist: Artist) -> None:
+        """Ad-hoc view from search: every song by an artist, flattened."""
+        title = f"artist · {artist.name}"
+        self.view = f"artist:{artist.id}"
+        self._highlight_view(None)
+        cache_key = f"artist-songs-{artist.id}"
+        cached = self.dirs.read_cache(cache_key)
+        if cached:
+            self._show_songs([Song.from_dict(s) for s in cached.get("songs", [])], title)
+        try:
+            albums = await self.client.get_artist_albums(artist.id)
+            results = await asyncio.gather(
+                *(self.client.get_album_songs(a.id) for a in albums),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        songs: list[Song] = []
+        for r in results:
+            if isinstance(r, list):
+                songs.extend(r)
+        self.dirs.write_cache(cache_key, {"songs": [s.to_dict() for s in songs]})
+        self._show_songs(songs, title)
+        self.query_one("#tracks-list", ClickList).focus()
+
+    @work(exclusive=True, group="lib")
+    async def _load_playlists(self) -> None:
+        try:
+            playlists = await self.client.get_playlists()
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        self.dirs.write_cache("playlists", {"playlists": [p.to_dict() for p in playlists]})
+        self._playlists = playlists
+        self._render_sidebar()
 
     # ── row rendering ─────────────────────────────────────────────────
-    @staticmethod
-    def _row() -> Text:
-        return Text(no_wrap=True, overflow="ellipsis")
-
-    def _artist_row(self, a: Artist) -> Option:
-        row = self._row()
-        row.append(f"{icons.USER} ", style=palette.peach if a.starred else palette.faint)
-        row.append(a.name, style=palette.text)
-        row.append(f" {a.album_count}", style=palette.vfaint)
-        return Option(row, id=a.id)
-
-    def _album_row(self, a: Album) -> Option:
-        row = self._row()
-        row.append("◉ ", style=palette.mauve)
-        row.append(a.name, style=palette.text)
-        if a.starred:
-            row.append(f" {icons.STAR}", style=palette.yellow)
-        meta = f" {a.year}" if a.year else ""
-        row.append(f"{meta} · {a.song_count}♪", style=palette.vfaint)
-        return Option(row, id=a.id)
-
-    def _song_row(self, s: Song, number: int | None = None) -> Option:
+    def _song_row(self, s: Song) -> Option:
         current = self.queue.current
         is_current = current is not None and s.id == current.id
-        row = self._row()
-        marker = anim.NOTE_FRAMES[0] if is_current else (f"{number:>2d}" if number else " ·")
-        row.append(f"{marker} ", style=palette.blue if is_current else palette.vfaint)
+        row = Text(no_wrap=True, overflow="ellipsis")
+        marker = anim.NOTE_FRAMES[0] if is_current else "·"
+        row.append(f" {marker} ", style=palette.blue if is_current else palette.vfaint)
         row.append(s.title, style=f"bold {palette.blue}" if is_current else palette.text)
         if s.starred:
             row.append(f" {icons.STAR}", style=palette.yellow)
         row.append(f"  {s.artist}", style=palette.dim)
         row.append(f" · {anim.fmt_time(s.duration)}", style=palette.vfaint)
         return Option(row, id=s.id)
-
-    def _playlist_row(self, p: Playlist) -> Option:
-        row = self._row()
-        row.append(f"{icons.LIST} ", style=palette.lav)
-        row.append(p.name, style=palette.text)
-        row.append(f"  {p.song_count}♪ · {anim.fmt_time(p.duration)}", style=palette.vfaint)
-        return Option(row, id=p.id)
-
-    def _view_row(self, view_id: str, label: str) -> Option:
-        row = self._row()
-        row.append("◍ ", style=palette.mauve)
-        row.append(label, style=palette.text)
-        return Option(row, id=view_id)
 
     def _fill(self, selector: str, options: list[Option], subtitle_of: str | None = None) -> None:
         ol = self.query_one(selector, NavList)
@@ -422,232 +483,17 @@ class NaviTuiApp(KitApp):
         if had_focus:
             ol.focus()
 
-    # ── library tab ───────────────────────────────────────────────────
-    @work(exclusive=True, group="lib")
-    async def _load_artists(self) -> None:
-        cached = self.dirs.read_cache("artists")
-        if cached:
-            self._artists = [Artist.from_dict(a) for a in cached.get("artists", [])]
-            self._fill("#pane1-list", [self._artist_row(a) for a in self._artists], "#pane1-panel")
-        try:
-            self._artists = await self.client.get_artists()
-        except Exception as e:
-            self._connection_trouble(e)
-            return
-        self.dirs.write_cache("artists", {"artists": [a.to_dict() for a in self._artists]})
-        if self.tab == "library":
-            self._fill("#pane1-list", [self._artist_row(a) for a in self._artists], "#pane1-panel")
+    # ── tracks pane ───────────────────────────────────────────────────
+    @on(OptionList.OptionHighlighted, "#tracks-list")
+    def _track_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if self.player is not None and self.player.active:
+            return  # while playing, the cover belongs to the current song
+        song = next((s for s in self._songs if s.id == event.option.id), None)
+        if song is not None and song.cover_art:
+            self._load_art(song.cover_art, f"song-{song.id}")
 
-    @work(exclusive=True, group="albums")
-    async def _load_artist_albums(self, artist: Artist) -> None:
-        await asyncio.sleep(0.12)  # superseded while the cursor is moving
-        key = f"artist-albums-{artist.id}"
-        cached = self.dirs.read_cache(key)
-        if cached:
-            self._albums = [Album.from_dict(a) for a in cached.get("albums", [])]
-            self._fill("#pane2-list", [self._album_row(a) for a in self._albums], "#pane2-panel")
-        try:
-            albums = await self.client.get_artist_albums(artist.id)
-        except Exception:
-            return
-        self.dirs.write_cache(key, {"albums": [a.to_dict() for a in albums]})
-        if self.tab == "library":
-            self._albums = albums
-            self._fill("#pane2-list", [self._album_row(a) for a in albums], "#pane2-panel")
-
-    @work(exclusive=True, group="songs")
-    async def _load_album_songs(self, album: Album) -> None:
-        await asyncio.sleep(0.12)
-        if not (self.player and self.player.active) and album.cover_art:
-            self._load_art(album.cover_art, f"album-{album.id}")
-        key = f"album-songs-{album.id}"
-        cached = self.dirs.read_cache(key)
-        if cached:
-            self._songs = [Song.from_dict(s) for s in cached.get("songs", [])]
-            self._fill("#pane3-list", [self._song_row(s, s.track) for s in self._songs], "#pane3-panel")
-        try:
-            songs = await self.client.get_album_songs(album.id)
-        except Exception:
-            return
-        self.dirs.write_cache(key, {"songs": [s.to_dict() for s in songs]})
-        self._songs = songs
-        self._fill("#pane3-list", [self._song_row(s, s.track) for s in songs], "#pane3-panel")
-
-    # ── albums tab ────────────────────────────────────────────────────
-    @work(exclusive=True, group="albumlist")
-    async def _load_album_view(self, view: str) -> None:
-        await asyncio.sleep(0.12)
-        if view == "random-songs":
-            try:
-                songs = await self.client.get_random_songs(100)
-            except Exception as e:
-                self._connection_trouble(e)
-                return
-            self._songs = songs
-            self._fill("#pane2-list", [])
-            self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
-            return
-        if view in ("all-songs", "shuffle-all"):
-            cached = self.dirs.read_cache("all-songs")
-            if cached:
-                self._songs = [Song.from_dict(s) for s in cached.get("songs", [])]
-                self._fill("#pane2-list", [])
-                self._fill("#pane3-list", [self._song_row(s) for s in self._songs], "#pane3-panel")
-            try:
-                songs = await self.client.get_all_songs()
-            except Exception as e:
-                self._connection_trouble(e)
-                return
-            self.dirs.write_cache("all-songs", {"songs": [s.to_dict() for s in songs]})
-            if self.tab == "albums":
-                self._songs = songs
-                self._fill("#pane2-list", [])
-                self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
-            return
-        key = f"albumlist-{view}"
-        cached = None if view == "random" else self.dirs.read_cache(key)
-        if cached:
-            self._albums = [Album.from_dict(a) for a in cached.get("albums", [])]
-            self._fill("#pane2-list", [self._album_row(a) for a in self._albums], "#pane2-panel")
-        try:
-            albums = await self.client.get_album_list(view)
-        except Exception as e:
-            self._connection_trouble(e)
-            return
-        if view != "random":
-            self.dirs.write_cache(key, {"albums": [a.to_dict() for a in albums]})
-        if self.tab == "albums":
-            self._albums = albums
-            self._fill("#pane2-list", [self._album_row(a) for a in albums], "#pane2-panel")
-
-    # ── playlists tab ─────────────────────────────────────────────────
-    @work(exclusive=True, group="lib")
-    async def _load_playlists(self) -> None:
-        cached = self.dirs.read_cache("playlists")
-        if cached:
-            self._pane1_playlists = [Playlist.from_dict(p) for p in cached.get("playlists", [])]
-            self._fill("#pane1-list", [self._playlist_row(p) for p in self._pane1_playlists], "#pane1-panel")
-        try:
-            playlists = await self.client.get_playlists()
-        except Exception as e:
-            self._connection_trouble(e)
-            return
-        self.dirs.write_cache("playlists", {"playlists": [p.to_dict() for p in playlists]})
-        if self.tab == "playlists":
-            self._pane1_playlists = playlists
-            self._fill("#pane1-list", [self._playlist_row(p) for p in playlists], "#pane1-panel")
-
-    @work(exclusive=True, group="songs")
-    async def _load_playlist_songs(self, playlist: Playlist) -> None:
-        await asyncio.sleep(0.12)
-        key = f"playlist-songs-{playlist.id}"
-        cached = self.dirs.read_cache(key)
-        if cached:
-            self._songs = [Song.from_dict(s) for s in cached.get("songs", [])]
-            self._fill("#pane3-list", [self._song_row(s) for s in self._songs], "#pane3-panel")
-        try:
-            songs = await self.client.get_playlist_songs(playlist.id)
-        except Exception:
-            return
-        self.dirs.write_cache(key, {"songs": [s.to_dict() for s in songs]})
-        if self.tab == "playlists":
-            self._songs = songs
-            self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
-
-    # ── starred tab ───────────────────────────────────────────────────
-    @work(exclusive=True, group="lib")
-    async def _load_starred(self) -> None:
-        cached = self.dirs.read_cache("starred")
-        if cached:
-            self._apply_starred(
-                [Artist.from_dict(a) for a in cached.get("artists", [])],
-                [Album.from_dict(a) for a in cached.get("albums", [])],
-                [Song.from_dict(s) for s in cached.get("songs", [])],
-            )
-        try:
-            starred = await self.client.get_starred()
-        except Exception as e:
-            self._connection_trouble(e)
-            return
-        self.dirs.write_cache(
-            "starred",
-            {
-                "artists": [a.to_dict() for a in starred.artists],
-                "albums": [a.to_dict() for a in starred.albums],
-                "songs": [s.to_dict() for s in starred.songs],
-            },
-        )
-        if self.tab == "starred":
-            self._apply_starred(starred.artists, starred.albums, starred.songs)
-
-    def _apply_starred(self, artists: list[Artist], albums: list[Album], songs: list[Song]) -> None:
-        self._artists = artists
-        self._albums = albums
-        self._songs = songs
-        self._starred_songs = songs
-        self._fill("#pane1-list", [self._artist_row(a) for a in artists], "#pane1-panel")
-        self._fill("#pane2-list", [self._album_row(a) for a in albums], "#pane2-panel")
-        self._fill("#pane3-list", [self._song_row(s) for s in songs], "#pane3-panel")
-
-    # ── selection plumbing ────────────────────────────────────────────
-    @on(OptionList.OptionHighlighted, "#pane1-list")
-    def _pane1_highlighted(self, event: OptionList.OptionHighlighted) -> None:
-        oid = event.option.id
-        if not oid:
-            return
-        if self.tab == "library":
-            artist = next((a for a in self._artists if a.id == oid), None)
-            if artist:
-                self._load_artist_albums(artist)
-        elif self.tab == "albums":
-            self._load_album_view(oid)
-        elif self.tab == "playlists":
-            playlist = next((p for p in self._pane1_playlists if p.id == oid), None)
-            if playlist:
-                self._load_playlist_songs(playlist)
-
-    @on(OptionList.OptionSelected, "#pane1-list")
-    def _pane1_selected(self, event: OptionList.OptionSelected) -> None:
-        if self.tab == "playlists":
-            if self._songs:
-                self._play_songs(self._songs, 0)
-        elif self.tab == "starred":
-            pass
-        elif self.tab == "albums" and event.option.id == "shuffle-all":
-            self._shuffle_everything()
-        elif self.tab == "albums" and event.option.id in SONG_VIEWS:
-            self.query_one("#pane3-list", NavList).focus()
-        else:
-            self.query_one("#pane2-list", NavList).focus()
-
-    def _shuffle_everything(self) -> None:
-        if not self._songs:
-            self.notify("still fetching the library — try again in a second", timeout=3)
-            return
-        if not self.queue.shuffle:
-            self.queue.shuffle = True
-            self.query_one("#now", NowPlaying).shuffle = True
-            self.dirs.save_state({"shuffle": True})
-        self._play_songs(self._songs, random.randrange(len(self._songs)))
-        self.notify(f"shuffling all {len(self._songs)} tracks", timeout=3)
-
-    @on(OptionList.OptionHighlighted, "#pane2-list")
-    def _pane2_highlighted(self, event: OptionList.OptionHighlighted) -> None:
-        if self.tab == "starred":
-            return  # starred panes are independent
-        oid = event.option.id
-        album = next((a for a in self._albums if a.id == oid), None)
-        if album:
-            self._load_album_songs(album)
-
-    @on(OptionList.OptionSelected, "#pane2-list")
-    def _pane2_selected(self, event: OptionList.OptionSelected) -> None:
-        album = next((a for a in self._albums if a.id == event.option.id), None)
-        if album:
-            self._play_album(album)
-
-    @on(OptionList.OptionSelected, "#pane3-list")
-    def _pane3_selected(self, event: OptionList.OptionSelected) -> None:
+    @on(OptionList.OptionSelected, "#tracks-list")
+    def _track_selected(self, event: OptionList.OptionSelected) -> None:
         idx = next((i for i, s in enumerate(self._songs) if s.id == event.option.id), None)
         if idx is not None:
             self._play_songs(self._songs, idx)
@@ -659,21 +505,16 @@ class NaviTuiApp(KitApp):
             self._play_current()
 
     # ── playback ──────────────────────────────────────────────────────
-    def _play_album(self, album: Album) -> None:
-        async def load_and_play() -> None:
-            key = f"album-songs-{album.id}"
-            cached = self.dirs.read_cache(key)
-            songs = [Song.from_dict(s) for s in (cached or {}).get("songs", [])]
-            if not songs:
-                try:
-                    songs = await self.client.get_album_songs(album.id)
-                    self.dirs.write_cache(key, {"songs": [s.to_dict() for s in songs]})
-                except Exception as e:
-                    self._connection_trouble(e)
-                    return
-            self._play_songs(songs, 0)
-
-        self.run_worker(load_and_play(), group="mutate")
+    def _shuffle_everything(self) -> None:
+        if not self._songs:
+            self.notify("still fetching the library — try again in a second", timeout=3)
+            return
+        if not self.queue.shuffle:
+            self.queue.shuffle = True
+            self.query_one("#now", NowPlaying).shuffle = True
+            self.dirs.save_state({"shuffle": True})
+        self._play_songs(self._songs, random.randrange(len(self._songs)))
+        self.notify(f"shuffling all {len(self._songs)} tracks", timeout=3)
 
     def _play_songs(self, songs: list[Song], start: int) -> None:
         self.queue.set_songs(songs, start)
@@ -700,10 +541,7 @@ class NaviTuiApp(KitApp):
 
     def _refresh_song_markers(self) -> None:
         """Re-render the tracks pane so the ♪ marker follows the player."""
-        if self.tab in ("library",):
-            self._fill("#pane3-list", [self._song_row(s, s.track) for s in self._songs])
-        else:
-            self._fill("#pane3-list", [self._song_row(s) for s in self._songs])
+        self._fill("#tracks-list", [self._song_row(s) for s in self._songs])
 
     def action_play_pause(self) -> None:
         if self.player.active:
@@ -825,69 +663,55 @@ class NaviTuiApp(KitApp):
         panel = self.query_one("#queue-panel")
         options = []
         for i, song in enumerate(self.queue.songs):
-            row = self._row()
-            if i == self.queue.index:
+            row = Text(no_wrap=True, overflow="ellipsis")
+            if i < self.queue.index:
+                # already played: dim it way down, scroll up to revisit
+                row.append(f"{i + 1:>2d} ", style=palette.vfaint)
+                row.append(song.title, style=palette.faint)
+                row.append(f"  {song.artist}", style=palette.vfaint)
+            elif i == self.queue.index:
                 glyph = PLAY_GLYPH if (self.player and self.player.active and not self.player.paused) else PAUSE_GLYPH
                 row.append(f"{glyph} ", style=palette.green)
                 row.append(song.title, style=f"bold {palette.blue}")
+                row.append(f"  {song.artist}", style=palette.dim)
             else:
                 row.append(f"{i + 1:>2d} ", style=palette.vfaint)
                 row.append(song.title, style=palette.text)
-            row.append(f"  {song.artist}", style=palette.dim)
+                row.append(f"  {song.artist}", style=palette.dim)
             options.append(Option(row, id=f"q{i}"))
         self._fill("#queue-list", options)
         ol = self.query_one("#queue-list", NavList)
         if options and 0 <= self.queue.index < len(options):
             ol.highlighted = self.queue.index
-        total = sum(s.duration for s in self.queue.songs)
+            # pin the current track to the top so the panel reads "up next";
+            # only when the track changes, so manual scrollback isn't fought
+            if self.queue.index != self._queue_scrolled_to:
+                self._queue_scrolled_to = self.queue.index
+                index = self.queue.index
+                self.call_after_refresh(
+                    lambda: ol.scroll_to(y=index, animate=False)
+                )
+        upcoming = self.queue.songs[self.queue.index + 1 :] if self.queue.index >= 0 else self.queue.songs
+        remaining = sum(s.duration for s in upcoming)
         panel.border_subtitle = (
-            f"{len(self.queue.songs)}♪ · {anim.fmt_time(total)}" if self.queue.songs else None
+            f"{len(upcoming)}♪ up next · {anim.fmt_time(remaining)}" if self.queue.songs else None
         )
 
     def action_enqueue(self, play_next: bool) -> None:
         focused = self.focused
-        songs: list[Song] = []
-        label = ""
-        if focused is not None and focused.id == "pane3-list":
-            ol = self.query_one("#pane3-list", NavList)
-            if ol.highlighted is not None and ol.highlighted < len(self._songs):
-                song = self._songs[ol.highlighted]
-                songs, label = [song], song.title
-        elif focused is not None and focused.id == "pane2-list":
-            ol = self.query_one("#pane2-list", NavList)
-            if ol.highlighted is not None and ol.highlighted < len(self._albums):
-                album = self._albums[ol.highlighted]
-                cached = self.dirs.read_cache(f"album-songs-{album.id}")
-                songs = [Song.from_dict(s) for s in (cached or {}).get("songs", [])]
-                label = album.name
-                if not songs:
-                    self._enqueue_album_async(album, play_next)
-                    return
-        if not songs:
+        if focused is None or focused.id != "tracks-list":
             return
+        ol = self.query_one("#tracks-list", NavList)
+        if ol.highlighted is None or ol.highlighted >= len(self._songs):
+            return
+        song = self._songs[ol.highlighted]
         if play_next:
-            self.queue.add_next(songs)
+            self.queue.add_next([song])
         else:
-            self.queue.add(songs)
+            self.queue.add([song])
         self._render_queue()
         self._persist_queue()
-        self.notify(f"queued {'next: ' if play_next else ''}{label}", timeout=2)
-
-    @work(group="mutate")
-    async def _enqueue_album_async(self, album: Album, play_next: bool) -> None:
-        try:
-            songs = await self.client.get_album_songs(album.id)
-        except Exception as e:
-            self._connection_trouble(e)
-            return
-        self.dirs.write_cache(f"album-songs-{album.id}", {"songs": [s.to_dict() for s in songs]})
-        if play_next:
-            self.queue.add_next(songs)
-        else:
-            self.queue.add(songs)
-        self._render_queue()
-        self._persist_queue()
-        self.notify(f"queued {'next: ' if play_next else ''}{album.name}", timeout=2)
+        self.notify(f"queued {'next: ' if play_next else ''}{song.title}", timeout=2)
 
     def action_queue_remove(self) -> None:
         focused = self.focused
@@ -919,47 +743,95 @@ class NaviTuiApp(KitApp):
         data["position"] = position if position is not None else (self.player.position if self.player else 0.0)
         self.dirs.write_cache("queue", data)
 
-    # ── starring ──────────────────────────────────────────────────────
-    def action_star(self) -> None:
+    # ── playlists ─────────────────────────────────────────────────────
+    def _highlighted_song(self) -> Song | None:
         focused = self.focused
-        if focused is None:
-            return
-        item = None
-        kind = ""
-        if focused.id == "pane3-list":
-            ol = self.query_one("#pane3-list", NavList)
+        if focused is not None and focused.id == "tracks-list":
+            ol = self.query_one("#tracks-list", NavList)
             if ol.highlighted is not None and ol.highlighted < len(self._songs):
-                item, kind = self._songs[ol.highlighted], "song"
-        elif focused.id == "pane2-list":
-            ol = self.query_one("#pane2-list", NavList)
-            if ol.highlighted is not None and ol.highlighted < len(self._albums):
-                item, kind = self._albums[ol.highlighted], "album"
-        elif focused.id == "pane1-list" and self.tab in ("library", "starred"):
-            ol = self.query_one("#pane1-list", NavList)
-            if ol.highlighted is not None and ol.highlighted < len(self._artists):
-                item, kind = self._artists[ol.highlighted], "artist"
-        elif focused.id == "queue-list":
+                return self._songs[ol.highlighted]
+        elif focused is not None and focused.id == "queue-list":
             ol = self.query_one("#queue-list", NavList)
             if ol.highlighted is not None and ol.highlighted < len(self.queue.songs):
-                item, kind = self.queue.songs[ol.highlighted], "song"
-        if item is None:
-            return
-        item.starred = not item.starred  # optimistic — the cache IS the truth
-        self._star(item.id, kind, item.starred)
-        self._repaint_lists()
-        current = self.queue.current
-        if kind == "song" and current is not None and item.id == current.id:
-            current.starred = item.starred
-            self.query_one("#now", NowPlaying).song = current
+                return self.queue.songs[ol.highlighted]
+        return None
 
-    def _repaint_lists(self) -> None:
-        if self.tab == "library":
-            self._fill("#pane1-list", [self._artist_row(a) for a in self._artists])
-        elif self.tab == "starred":
-            self._apply_starred(self._artists, self._albums, self._songs)
+    def action_playlist_add(self) -> None:
+        song = self._highlighted_song()
+        if song is None:
+            self.notify("highlight a track first (tracks or queue panel)", timeout=3)
             return
-        self._fill("#pane2-list", [self._album_row(a) for a in self._albums])
+        options = [
+            Option(Text(f" {icons.LIST} {p.name}", style=palette.text), id=f"pl:{p.id}")
+            for p in self._playlists
+        ]
+        options.append(Option(Text(f" {icons.PLUS} new playlist…", style=palette.sub), id="pl-new"))
+
+        def picked(choice: str | None) -> None:
+            if not choice:
+                return
+            if choice == "pl-new":
+                self.push_screen(
+                    InputModal("new playlist", placeholder="name"),
+                    lambda name: self._playlist_create(name, song) if name else None,
+                )
+            else:
+                pid = choice.split(":", 1)[1]
+                self._playlist_append(pid, song)
+
+        self.push_screen(PickerModal(f"add “{song.title}” to…", options), picked)
+
+    def _playlist_created_name(self, name: str | None) -> None:
+        if name:
+            self._playlist_create(name, None)
+
+    @work(group="mutate")
+    async def _playlist_create(self, name: str, song: Song | None) -> None:
+        self._mutations += 1
+        try:
+            await self.client.create_playlist(name, [song.id] if song else [])
+        except Exception as e:
+            self.notify(f"couldn't create playlist: {e}", severity="error", timeout=5)
+            return
+        finally:
+            self._mutations -= 1
+        self.notify(
+            f"created “{name}”" + (f" with {song.title}" if song else ""), timeout=3
+        )
+        self._load_playlists()
+
+    @work(group="mutate")
+    async def _playlist_append(self, playlist_id: str, song: Song) -> None:
+        self._mutations += 1
+        try:
+            await self.client.add_to_playlist(playlist_id, [song.id])
+        except Exception as e:
+            self.notify(f"couldn't add to playlist: {e}", severity="error", timeout=5)
+            return
+        finally:
+            self._mutations -= 1
+        playlist = next((p for p in self._playlists if p.id == playlist_id), None)
+        self.notify(f"added to “{playlist.name if playlist else 'playlist'}”", timeout=3)
+        # the playlist's cached songs are stale now
+        try:
+            (self.dirs.cache_dir / f"playlist-songs-{playlist_id}.json").unlink()
+        except OSError:
+            pass
+        self._load_playlists()
+
+    # ── starring ──────────────────────────────────────────────────────
+    def action_star(self) -> None:
+        song = self._highlighted_song()
+        if song is None:
+            return
+        song.starred = not song.starred  # optimistic — the cache IS the truth
+        self._star(song.id, "song", song.starred)
         self._refresh_song_markers()
+        self._render_queue()
+        current = self.queue.current
+        if current is not None and song.id == current.id:
+            current.starred = song.starred
+            self.query_one("#now", NowPlaying).song = current
 
     @work(group="mutate")
     async def _star(self, item_id: str, kind: str, star: bool) -> None:
@@ -998,30 +870,43 @@ class NaviTuiApp(KitApp):
     def _search_done(self, result) -> None:
         if not result:
             return
-        if result[0] == "song":
+        kind = result[0]
+        if kind == "song":
             _, songs, index = result
             self._play_songs(songs, index)
-        elif result[0] == "album":
-            album = result[1]
-            self._play_album(album)
-            self.notify(f"playing {album.name}", timeout=2)
-        elif result[0] == "artist":
-            artist = result[1]
-            self.action_set_tab("library")
-            ol = self.query_one("#pane1-list", NavList)
-            idx = next((i for i, a in enumerate(self._artists) if a.id == artist.id), None)
-            if idx is not None:
-                ol.highlighted = idx
-                ol.focus()
+        elif kind == "song-queue":
+            _, song, play_next = result
+            if play_next:
+                self.queue.add_next([song])
+            else:
+                self.queue.add([song])
+            self._render_queue()
+            self._persist_queue()
+            self.notify(f"queued {'next: ' if play_next else ''}{song.title}", timeout=2)
+        elif kind == "album":
+            self._enqueue_album(result[1])
+        elif kind == "artist":
+            self._load_artist_songs(result[1])
+
+    @work(group="mutate")
+    async def _enqueue_album(self, album: Album) -> None:
+        try:
+            songs = await self.client.get_album_songs(album.id)
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        self.queue.add(songs)
+        self._render_queue()
+        self._persist_queue()
+        self.notify(f"queued album: {album.name}", timeout=3)
 
     # ── misc actions ──────────────────────────────────────────────────
     def action_focus_panel(self, direction: int) -> None:
-        ids = ["pane1-list", "pane2-list", "pane3-list", "queue-list"]
-        if self.tab == "playlists":
-            ids.remove("pane2-list")  # that panel is hidden on this tab
-        lists = [self.query_one(f"#{i}", NavList) for i in ids]
-        if not lists:
-            return
+        lists = [
+            self.query_one("#sidebar-list", NavList),
+            self.query_one("#tracks-list", NavList),
+            self.query_one("#queue-list", NavList),
+        ]
         focused = self.focused
         try:
             i = lists.index(focused)
@@ -1031,7 +916,11 @@ class NaviTuiApp(KitApp):
         lists[(i + direction) % len(lists)].focus()
 
     def action_refresh(self) -> None:
-        self._show_tab(initial=True)
+        self._load_playlists()
+        if self.view.startswith("artist:"):
+            pass  # ad-hoc view; nothing to re-trigger
+        else:
+            self._load_view(self.view)
         self.notify("refreshing", timeout=1.5)
 
     def _maybe_auto_refresh(self) -> None:
@@ -1039,7 +928,9 @@ class NaviTuiApp(KitApp):
             return
         if self.screen is not self.screen_stack[0]:
             return  # modal open — don't yank state around underneath it
-        self._show_tab(initial=True)
+        self._load_playlists()
+        if not self.view.startswith("artist:"):
+            self._load_view(self.view)
 
     def action_help(self) -> None:
         self.push_screen(HelpModal(HELP_SECTIONS, title="NaviTui · keys"))
@@ -1047,10 +938,10 @@ class NaviTuiApp(KitApp):
     def on_kit_theme_changed(self) -> None:
         if not self.kit_theme_previewing:
             self.dirs.save_state({"theme": self.theme})
-        self._render_tabs()
         self._render_status()
         if self.client is not None:
-            self._repaint_lists()
+            self._render_sidebar()
+            self._refresh_song_markers()
             self._render_queue()
 
     def _persist_width(self, selector: str, width: int | None) -> None:

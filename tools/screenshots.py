@@ -213,6 +213,19 @@ class FakeClient:
     async def get_all_songs(self, max_songs=5000):
         return [s for songs in self.songs.values() for s in songs][:max_songs]
 
+    async def get_songs_by_albums(self, list_type, albums=15):
+        album_list = await self.get_album_list(list_type)
+        out = []
+        for a in album_list[:albums]:
+            out.extend(self.songs[a.id])
+        return out
+
+    async def create_playlist(self, name, song_ids):
+        pass
+
+    async def add_to_playlist(self, playlist_id, song_ids):
+        pass
+
     def stream_url(self, song_id):
         return str(self._tone)
 
