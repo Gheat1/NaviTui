@@ -131,10 +131,10 @@ class NowPlaying(Static):
     def flash_volume(self) -> None:
         self._vol_flash = 10
 
-    def tick(self) -> None:
+    def tick(self, level: float | None = None) -> None:
         self._tick += 1
         self.viz.energy = 1.0 if self.playing else 0.0
-        self.viz.tick()
+        self.viz.tick(level if self.playing else None)
         if self._title_flash > 0:
             self._title_flash -= 1
         if self._vol_flash > 0:

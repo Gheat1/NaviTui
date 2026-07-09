@@ -54,6 +54,7 @@ class Player:
         self._want_playing = False
         self._closing = False
         self._last_forwarded = -1.0
+        self._level = 0.0  # live audio loudness, ~0..1 (written from mpv's thread)
 
         opts: dict = dict(
             video=False,
@@ -68,6 +69,35 @@ class Player:
         if ao:
             opts["ao"] = ao
         self._m = _mpv.MPV(**opts)
+
+        # Attach an ebur128 loudness meter and observe its momentary level so
+        # the visualizer can pump with real audio. Everything is feature-
+        # detected: if the filter or metadata isn't available the level stays
+        # at 0.0 and the widgets fall back to their faked motion.
+        self._level_ok = False
+        try:
+            self._m.command("af", "add", "@nav:lavfi=[ebur128=metadata=1]")
+
+            @self._m.property_observer("af-metadata/nav")
+            def _loud(_name, value) -> None:
+                if self._closing or not value:
+                    return
+                m = value.get("lavfi.r128.M")
+                if m is None:
+                    return
+                try:
+                    lufs = float(m)
+                except (TypeError, ValueError):
+                    return
+                # ebur128 M ranges roughly -70 (silence) .. 0 LUFS; map the
+                # useful -50..-5 band onto 0..1. Just store a float here —
+                # never touch the UI from mpv's thread.
+                self._level = max(0.0, min(1.0, (lufs + 50.0) / 45.0))
+                self._level_ok = True
+
+            self._level_ok = True
+        except Exception:
+            self._level_ok = False
 
         @self._m.property_observer("time-pos")
         def _time(_name, value) -> None:
@@ -116,6 +146,7 @@ class Player:
         self._m.command("stop")
         self.position = 0.0
         self.duration = 0.0
+        self._level = 0.0
 
     @property
     def paused(self) -> bool:
@@ -131,6 +162,15 @@ class Player:
     def active(self) -> bool:
         """A track is loaded (playing or paused)."""
         return self._want_playing
+
+    @property
+    def level(self) -> float:
+        """Live audio loudness in ~0..1, or 0.0 when no real signal is
+        available (meter unsupported / nothing playing). Read on every
+        heartbeat to drive the visualizer."""
+        if not self._level_ok or not self._want_playing:
+            return 0.0
+        return self._level
 
     def seek(self, seconds: float) -> None:
         if not self._want_playing:
@@ -187,6 +227,7 @@ class NullPlayer:
     active = False
     volume = 100
     muted = False
+    level = 0.0
 
     def __init__(self, *a, **kw) -> None:
         pass

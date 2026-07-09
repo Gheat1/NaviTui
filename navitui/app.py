@@ -370,10 +370,12 @@ class NaviTuiApp(KitApp):
         try:
             self.query_one("#logo", Logo).tick()
             now = self.query_one("#now", NowPlaying)
+            level = None
             if self.player is not None:
                 now.set_playing(self.player.active and not self.player.paused)
                 now.set_class(self.player.active, "playing")
-            now.tick()
+                level = self.player.level
+            now.tick(level)
             busy = any(
                 not w.is_finished
                 for w in self.workers
