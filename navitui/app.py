@@ -483,6 +483,16 @@ class NaviTuiApp(KitApp):
         }
         if await self.mpris.start(controls):
             self._announce()
+        # notification action buttons ride the same event loop: an invoked
+        # button calls straight back into an app action (falls back to a
+        # buttonless notification when the dbus service isn't reachable).
+        await self.notifier.start(
+            {
+                "previous": self.action_prev_track,
+                "play-pause": self.action_play_pause,
+                "next": self.action_next_track,
+            }
+        )
 
     async def _start_remote(self) -> None:
         # asyncio server on our own loop (like mpris): every handler drives an
@@ -2462,6 +2472,7 @@ class NaviTuiApp(KitApp):
 
     async def action_quit(self) -> None:
         self.mpris.stop()
+        self.notifier.stop()
         self.remote.stop()
         self.discord.stop()
         await self.listenbrainz.close()
