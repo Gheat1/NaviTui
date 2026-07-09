@@ -24,6 +24,8 @@ SHUFFLE_ICON = "\uf074"  # nf-fa-random
 REPEAT_ICON = "\uf01e"  # nf-fa-repeat
 PLAY_GLYPH = "\uf04b"  # nf-fa-play
 PAUSE_GLYPH = "\uf04c"  # nf-fa-pause
+SPEED_ICON = "\uf0e4"  # nf-fa-tachometer (playback speed)
+SLEEP_ICON = "\uf186"  # nf-fa-moon_o (sleep timer)
 
 
 class ClickList(NavList):
@@ -102,10 +104,13 @@ class NowPlaying(Static):
         self.muted = False
         self.shuffle = False
         self.repeat = Repeat.OFF
+        self.speed = 1.0
+        self.sleep_label = ""  # e.g. "12:04" remaining, or "end" — "" hides it
         self.viz = anim.VizModel(5, seed=7)
         self._tick = 0
         self._title_flash = 0  # ticks of brightness after a track change
         self._vol_flash = 0
+        self._speed_flash = 0
         self._bar_span: tuple[int, int] = (0, 0)  # x range of the seek bar
         self._gauge_span: tuple[int, int] = (0, 0)
         self._mode_spans: dict[str, tuple[int, int]] = {}
@@ -131,6 +136,9 @@ class NowPlaying(Static):
     def flash_volume(self) -> None:
         self._vol_flash = 10
 
+    def flash_speed(self) -> None:
+        self._speed_flash = 10
+
     def tick(self, level: float | None = None) -> None:
         self._tick += 1
         self.viz.energy = 1.0 if self.playing else 0.0
@@ -139,6 +147,8 @@ class NowPlaying(Static):
             self._title_flash -= 1
         if self._vol_flash > 0:
             self._vol_flash -= 1
+        if self._speed_flash > 0:
+            self._speed_flash -= 1
         self.update(self._render_lines())
 
     # ── drawing ───────────────────────────────────────────────────────
@@ -159,14 +169,26 @@ class NowPlaying(Static):
         star = f" {icons.STAR}" if self.song.starred else ""
         state = PLAY_GLYPH if self.playing else PAUSE_GLYPH
         line.append(f"{state} ", style=palette.green if self.playing else palette.peach)
+        # right-hand badges: speed (when not 1x) and the sleep countdown; both
+        # are subtle and only shown when active, so they cost the title no room
+        # otherwise. built here to measure their length before the marquee.
+        badges = Text()
+        if abs(self.speed - 1.0) > 1e-3:
+            spd_style = palette.mauve
+            if self._speed_flash > 0 and anim.can_blend():
+                spd_style = anim.blend(palette.mauve, "#ffffff", self._speed_flash / 12)
+            badges.append(f" {SPEED_ICON}{self.speed:g}x", style=spd_style)
+        if self.sleep_label:
+            badges.append(f" {SLEEP_ICON}{self.sleep_label}", style=palette.lav)
         # brighten the title briefly on track change, then settle
         flash = self._title_flash / 12
         title_color = anim.blend(palette.text, "#ffffff", 0.7 * flash)
-        room = width - line.cell_len - len(star) - 1
+        room = width - line.cell_len - len(star) - badges.cell_len - 1
         body = f"{self.song.title}  —  {self.song.artist} · {self.song.album}"
         line.append(anim.marquee(body, max(8, room), self._tick // 2), style=f"bold {title_color}")
         if star:
             line.append(star, style=palette.yellow)
+        line.append_text(badges)
         return line
 
     def _line_bottom(self, width: int) -> Text:
