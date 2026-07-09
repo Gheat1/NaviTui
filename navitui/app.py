@@ -97,6 +97,7 @@ HELP_SECTIONS = [
             ("j / k / g / G", "move in lists"),
             ("h / l", "previous / next panel"),
             ("/", "search  (enter play · a queue · A play next)"),
+            ("\\", "filter tracks pane  (type to narrow · esc clears)"),
             ("p", "add track to a playlist"),
             ("f", "star / unstar track"),
             ("d / D", "download track / whole view for offline"),
@@ -133,6 +134,7 @@ class NaviTuiApp(KitApp):
         _kb("search", "search", "search", show=True),
         _kb("shuffle", "toggle_shuffle", "shuffle", show=True),
         _kb("repeat", "cycle_repeat", "repeat", show=True),
+        _kb("filter", "filter"),
         _kb("seek_back", "seek(-5)"),
         _kb("seek_forward", "seek(5)"),
         _kb("seek_back_big", "seek(-30)"),
@@ -210,8 +212,15 @@ class NaviTuiApp(KitApp):
         self.queue = PlayQueue()
         self.player = None
         self.view: str = "all-songs"  # sidebar view id (or "pl:<id>", or "artist:<id>")
-        self._songs: list[Song] = []  # what the tracks pane shows
+        self._songs: list[Song] = []  # the full tracks-pane model
         self._playlists: list[Playlist] = []
+        # type-to-filter: an explicit mode over the tracks pane. `_filtering`
+        # captures keys in on_key so bare typing never fires a global bind;
+        # `_filtered` is the derived view the list renders while active, so
+        # play/enqueue/star still map to the right Song.
+        self._filtering = False
+        self._filter_query = ""
+        self._filtered: list[Song] = []
         # playback bookkeeping
         self._scrobbled = False
         self._end_failures = 0
@@ -611,6 +620,9 @@ class NaviTuiApp(KitApp):
 
     def _show_songs(self, songs: list[Song], title: str) -> None:
         self._songs = songs
+        # a fresh view supersedes any active filter (the rows changed under it)
+        if self._filtering:
+            self._exit_filter()
         panel = self.query_one("#tracks-panel")
         panel.border_title = title
         self._fill("#tracks-list", [self._song_row(s) for s in songs], "#tracks-panel")
@@ -725,6 +737,12 @@ class NaviTuiApp(KitApp):
             ol.focus()
 
     # ── tracks pane ───────────────────────────────────────────────────
+    def _tracks_view(self) -> list[Song]:
+        """The list the tracks pane is currently showing: the filtered subset
+        while filter mode is active, otherwise the full `_songs`. Row indices
+        and highlights map onto this, so play/enqueue/star stay correct."""
+        return self._filtered if self._filtering else self._songs
+
     @on(OptionList.OptionHighlighted, "#tracks-list")
     def _track_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if self.player is not None and self.player.active:
@@ -735,15 +753,94 @@ class NaviTuiApp(KitApp):
 
     @on(OptionList.OptionSelected, "#tracks-list")
     def _track_selected(self, event: OptionList.OptionSelected) -> None:
-        idx = next((i for i, s in enumerate(self._songs) if s.id == event.option.id), None)
+        view = self._tracks_view()
+        idx = next((i for i, s in enumerate(view) if s.id == event.option.id), None)
         if idx is not None:
-            self._play_songs(self._songs, idx)
+            self._play_songs(view, idx)
 
     @on(OptionList.OptionSelected, "#queue-list")
     def _queue_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.highlighted is not None:
             self.queue.jump(event.option_list.highlighted)
             self._play_current()
+
+    # ── type-to-filter (an explicit mode over the tracks pane) ─────────
+    # The app binds many bare single letters to global actions, so we never
+    # let typing narrow the list "ambiently". `\` opens filter mode; while it
+    # is active `on_key` (dispatched before App._on_key, which resolves the
+    # bindings) eats printable keys into the query and prevents the default
+    # binding, so `s`/`f`/`a`/… type instead of shuffling/starring/queueing.
+    # j/k/g/G/up/down/enter fall through untouched, so list navigation and
+    # "play the highlighted match" keep working; esc restores the full list.
+    def action_filter(self) -> None:
+        if not self._songs:
+            self.notify("nothing here to filter", timeout=2)
+            return
+        self.query_one("#tracks-list", ClickList).focus()
+        self._filtering = True
+        self._filter_query = ""
+        self._filtered = list(self._songs)
+        self._render_filter_bar()
+
+    def on_key(self, event) -> None:
+        if not self._filtering:
+            return
+        key = event.key
+        if key == "escape":
+            self._exit_filter()
+            event.prevent_default()
+            event.stop()
+            return
+        # navigation + selection belong to the (focused) tracks list; enter
+        # plays the highlighted match. Let these reach the binding system.
+        if key in ("up", "down", "j", "k", "g", "G", "home", "end",
+                   "pageup", "pagedown", "enter", "tab", "shift+tab"):
+            return
+        if key == "backspace":
+            self._filter_query = self._filter_query[:-1]
+            self._apply_filter()
+            event.prevent_default()
+            event.stop()
+            return
+        if event.is_printable and event.character:
+            self._filter_query += event.character
+            self._apply_filter()
+            event.prevent_default()
+            event.stop()
+
+    def _matches(self, song: Song, needle: str) -> bool:
+        """Case-insensitive substring over title + artist, with a light
+        subsequence fallback so 'dyln' still finds 'Bob Dylan'."""
+        hay = f"{song.title} {song.artist}".lower()
+        if needle in hay:
+            return True
+        it = iter(hay)
+        return all(ch in it for ch in needle)
+
+    def _apply_filter(self) -> None:
+        needle = self._filter_query.lower().strip()
+        self._filtered = (
+            [s for s in self._songs if self._matches(s, needle)] if needle else list(self._songs)
+        )
+        self._fill("#tracks-list", [self._song_row(s) for s in self._filtered])
+        self._render_filter_bar()
+
+    def _render_filter_bar(self) -> None:
+        panel = self.query_one("#tracks-panel")
+        count = len(self._filtered)
+        query = self._filter_query or " "
+        panel.border_subtitle = f"{icons.FILTER} {query}  {count}/{len(self._songs)}"
+
+    def _exit_filter(self) -> None:
+        if not self._filtering:
+            return
+        self._filtering = False
+        self._filter_query = ""
+        self._filtered = []
+        # restore the full list and let the heartbeat reset the subtitle
+        panel = self.query_one("#tracks-panel")
+        panel.border_subtitle = str(len(self._songs)) if self._songs else None
+        self._fill("#tracks-list", [self._song_row(s) for s in self._songs])
 
     # ── playback ──────────────────────────────────────────────────────
     def _shuffle_everything(self) -> None:
@@ -816,8 +913,9 @@ class NaviTuiApp(KitApp):
         self._announce(track_change=True)
 
     def _refresh_song_markers(self) -> None:
-        """Re-render the tracks pane so the ♪ marker follows the player."""
-        self._fill("#tracks-list", [self._song_row(s) for s in self._songs])
+        """Re-render the tracks pane so the ♪ marker (and stars, ✓, ratings)
+        follow the player — over the filtered view when one is active."""
+        self._fill("#tracks-list", [self._song_row(s) for s in self._tracks_view()])
 
     def action_play_pause(self) -> None:
         if self.player.active:
@@ -982,9 +1080,10 @@ class NaviTuiApp(KitApp):
         if focused is None or focused.id != "tracks-list":
             return
         ol = self.query_one("#tracks-list", NavList)
-        if ol.highlighted is None or ol.highlighted >= len(self._songs):
+        view = self._tracks_view()
+        if ol.highlighted is None or ol.highlighted >= len(view):
             return
-        song = self._songs[ol.highlighted]
+        song = view[ol.highlighted]
         if play_next:
             self.queue.add_next([song])
         else:
@@ -1028,8 +1127,9 @@ class NaviTuiApp(KitApp):
         focused = self.focused
         if focused is not None and focused.id == "tracks-list":
             ol = self.query_one("#tracks-list", NavList)
-            if ol.highlighted is not None and ol.highlighted < len(self._songs):
-                return self._songs[ol.highlighted]
+            view = self._tracks_view()
+            if ol.highlighted is not None and ol.highlighted < len(view):
+                return view[ol.highlighted]
         elif focused is not None and focused.id == "queue-list":
             ol = self.query_one("#queue-list", NavList)
             if ol.highlighted is not None and ol.highlighted < len(self.queue.songs):
