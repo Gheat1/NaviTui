@@ -31,7 +31,7 @@ from ricekit.widgets import NavList, Splitter
 from navitui import anim, artcolor, card, config as configmod, player as playermod
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
-from navitui.integrations import DiscordPresence, Notifier
+from navitui.integrations import DiscordPresence, ListenBrainz, Notifier
 from navitui.models import Album, Artist, Bookmark, Genre, Playlist, Song
 from navitui.mpris import Mpris
 from navitui import mutations as mutations_mod
@@ -370,6 +370,7 @@ class NaviTuiApp(KitApp):
         self.discord = DiscordPresence(
             bool(CONFIG["discord_rich_presence"]), str(CONFIG["discord_app_id"])
         )
+        self.listenbrainz = ListenBrainz(str(CONFIG["listenbrainz_token"]))
         self.mpris = Mpris()
         self.remote = Remote()
 
@@ -1106,7 +1107,7 @@ class NaviTuiApp(KitApp):
         now.set_song(song)
         now.set_progress(resume_at, song.duration)
         self._scrobbled = False
-        self._scrobble(song.id, False)
+        self._scrobble(song, False)
         if song.cover_art:
             self._load_art(song.cover_art, f"song-{song.id}")
         else:
@@ -1324,7 +1325,7 @@ class NaviTuiApp(KitApp):
         if song and not self._scrobbled and duration > 0:
             if position >= min(duration / 2, 240):
                 self._scrobbled = True
-                self._scrobble(song.id, True)
+                self._scrobble(song, True)
         # crash-safe resume point, at most every 10s
         if position - self._last_persist >= 10 or position < self._last_persist:
             self._last_persist = position
@@ -2204,17 +2205,31 @@ class NaviTuiApp(KitApp):
         self.notify(f"\uf012 stream quality: {label}", timeout=2)
 
     @work(group="mutate")
-    async def _scrobble(self, song_id: str, submission: bool) -> None:
+    async def _scrobble(self, song: Song, submission: bool) -> None:
         # best-effort but still worth buffering so play counts catch up; stays
         # silent (background write, no user gesture to acknowledge)
         if self._offline:
-            self.mutations.scrobble(song_id, submission)
+            self.mutations.scrobble(song.id, submission)
+            # ListenBrainz needs full track metadata the offline mutation queue
+            # (keyed by id) can't reconstruct, so its listens don't buffer — a
+            # missed listen is harmless, and never touching the network here
+            # keeps offline mode truly offline.
             return
         try:
-            await self.client.scrobble(song_id, submission)
+            await self.client.scrobble(song.id, submission)
         except Exception as e:
             if self._is_network_error(e):
-                self.mutations.scrobble(song_id, submission)
+                self.mutations.scrobble(song.id, submission)
+        # mirror the scrobble to ListenBrainz when configured (no-op otherwise):
+        # "playing_now" on track start, a counted listen at the submit threshold
+        if self.listenbrainz.enabled:
+            try:
+                if submission:
+                    await self.listenbrainz.submit(song)
+                else:
+                    await self.listenbrainz.now_playing(song)
+            except Exception:
+                pass  # opt-in extra; never let it disturb playback
 
     # ── art ───────────────────────────────────────────────────────────
     @work(exclusive=True, group="art")
@@ -2371,6 +2386,7 @@ class NaviTuiApp(KitApp):
         self.mpris.stop()
         self.remote.stop()
         self.discord.stop()
+        await self.listenbrainz.close()
         if self.player is not None:
             self._persist_queue()
             self.player.terminate()

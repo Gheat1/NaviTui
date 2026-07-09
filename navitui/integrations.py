@@ -141,3 +141,92 @@ def _presence_button(song: Song) -> dict | None:
     if isinstance(url, str) and url.startswith("https://"):
         return {"label": "Listen", "url": url}
     return None
+
+
+LISTENBRAINZ_URL = "https://api.listenbrainz.org/1/submit-listens"
+
+
+class ListenBrainz:
+    """ListenBrainz scrobbling, entirely opt-in: needs a user token from
+    listenbrainz.org/profile. Submits a "playing_now" listen on track start
+    and a "single" listen once a track counts as played — mirroring the
+    Subsonic scrobble it rides alongside. Degrades to a silent no-op: a
+    missing token, an import failure, or any network trouble must never be a
+    reason playback stalls.
+
+    Network calls are async and best-effort. `submit` is awaited from the
+    app's scrobble worker (never the UI thread); it swallows every error and
+    returns whether the listen was accepted so a caller can buffer on failure.
+    """
+
+    def __init__(self, token: str) -> None:
+        self._token = (token or "").strip()
+        self._http = None
+        if not self._token:
+            return
+        try:
+            import httpx
+
+            self._http = httpx.AsyncClient(timeout=10)
+        except Exception:
+            self._http = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._http is not None
+
+    async def submit(self, song: Song, listened_at: int | None = None) -> bool:
+        """A finished play: `listen_type` "single" with a listen timestamp.
+        Returns True if ListenBrainz accepted it, False on any failure (so the
+        caller may retry later). No-op (returns False) when disabled."""
+        return await self._post(_lb_payload(song, "single", listened_at))
+
+    async def now_playing(self, song: Song) -> bool:
+        """A "playing_now" listen — no timestamp; ListenBrainz treats it as a
+        transient "listening to" state, not a counted play."""
+        return await self._post(_lb_payload(song, "playing_now", None))
+
+    async def _post(self, payload: dict | None) -> bool:
+        if self._http is None or payload is None:
+            return False
+        try:
+            resp = await self._http.post(
+                LISTENBRAINZ_URL,
+                json=payload,
+                headers={"Authorization": f"Token {self._token}"},
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def close(self) -> None:
+        if self._http is not None:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
+
+
+def _lb_payload(song: Song, listen_type: str, listened_at: int | None) -> dict | None:
+    """Build the submit-listens body. ListenBrainz requires at minimum an
+    `artist_name` and `track_name`; without both there's nothing worth
+    sending, so return None and let the caller skip."""
+    artist = (song.artist or "").strip()
+    title = (song.title or "").strip()
+    if not (artist and title):
+        return None
+    info: dict = {"artist_name": artist, "track_name": title}
+    album = (song.album or "").strip()
+    if album:
+        info["release_name"] = album
+    additional: dict = {"media_player": "NaviTui", "submission_client": "NaviTui"}
+    if song.duration:
+        additional["duration"] = int(song.duration)
+    if getattr(song, "track", None):
+        additional["tracknumber"] = int(song.track)
+    info["additional_info"] = additional
+    listen: dict = {"track_metadata": info}
+    if listen_type == "single":
+        listen["listened_at"] = int(listened_at if listened_at is not None else time.time())
+    return {"listen_type": listen_type, "payload": [listen]}
