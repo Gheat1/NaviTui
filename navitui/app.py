@@ -35,6 +35,7 @@ from navitui.models import Album, Artist, Playlist, Song
 from navitui.mpris import Mpris
 from navitui import mutations as mutations_mod
 from navitui.mutations import MutationQueue
+from navitui.palette import NaviTuiCommands
 from navitui.playqueue import PlayQueue
 from navitui.remote import Remote, build_snapshot
 from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal
@@ -121,6 +122,7 @@ HELP_SECTIONS = [
             ("t", "cycle kit themes"),
             ("T", "theme picker (live preview)"),
             ("z", "zen / now-playing splash"),
+            ("ctrl+p", "command palette — every action, searchable"),
             ("?", "this help"),
             ("q", "quit"),
         ],
@@ -130,6 +132,11 @@ HELP_SECTIONS = [
 
 class NaviTuiApp(KitApp):
     TITLE = "NaviTui"
+
+    # our verb list on top of Textual's built-in system commands (never
+    # instead of them), so the palette lists NaviTui's actions and the
+    # standard theme/screenshot/quit system entries together
+    COMMANDS = KitApp.COMMANDS | {NaviTuiCommands}
 
     BINDINGS = [
         _kb("play_pause", "play_pause", "play/pause", show=True),
@@ -172,6 +179,10 @@ class NaviTuiApp(KitApp):
         _kb("theme_cycle", "cycle_kit_theme", "theme", show=True),
         _kb("theme_pick", "change_theme"),
         _kb("zen", "toggle_zen", "zen", show=True),
+        # explicit so it's remappable via player.toml; Textual would otherwise
+        # auto-bind ctrl+p. Naming the binding `command_palette` also stops the
+        # auto-bind from doubling up.
+        _kb("command_palette", "command_palette", "palette"),
         _kb("help", "help", "help", show=True),
         _kb("quit", "quit", "quit", show=True),
         # rating is fixed on the number row (press again to clear)
