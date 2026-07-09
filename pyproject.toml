@@ -42,6 +42,7 @@ Issues = "https://github.com/Gheat1/NaviTui/issues"
 [project.scripts]
 navitui = "navitui:main"
 navitui-mcp = "navitui.mcp:main"
+navitui-remote = "navitui.cli:main"
 
 [tool.setuptools]
 packages = ["navitui"]
