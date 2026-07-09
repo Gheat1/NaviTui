@@ -148,10 +148,12 @@ class Notifier:
         for action_id, label in NOTIFY_ACTIONS:
             actions += [action_id, label]
         icon = str(art_path) if art_path is not None else "NaviTui"
-        # hints: replace-in-place like the notify-send fallback, so repeated
-        # track changes update one bubble instead of stacking.
+        # replace-in-place is handled portably by `replaces_id` below; keep the
+        # hints minimal (just normal urgency) — the old Unity-only
+        # x-canonical-private-synchronous hint made some daemons swallow the
+        # popup entirely.
         hints = {
-            "x-canonical-private-synchronous": _Variant("s", "navitui"),
+            "urgency": _Variant("y", 1),  # 1 = normal
         }
         msg = Message(
             destination=NOTIFY_SERVICE,
