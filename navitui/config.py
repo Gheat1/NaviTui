@@ -32,6 +32,8 @@ KEYBINDS = {
     "queue_move_up":       "ctrl+up",
     "queue_move_down":     "ctrl+down",
     "star":                "f",
+    "start_radio":         "i",
+    "radio_toggle":        "I",
     "download":            "d",
     "download_view":       "D",
     "download_all":        "ctrl+d",
@@ -75,6 +77,10 @@ _TEMPLATE = """\
 
 # Desktop notification on track change (toggle at runtime with N)
 #notifications = true
+
+# Endless radio: when the queue drains, autoplay similar tracks forever.
+# Toggle at runtime with I; start a station from a track with i. Persisted
+# in app state, not here — this note is just a pointer to the keybinds.
 
 # Tint the UI with a color pulled from the current song's cover art.
 # Truecolor terminals only; the "system" (ANSI) theme leaves this inert.

@@ -204,6 +204,13 @@ class FakeClient:
     async def get_random_songs(self, size=50):
         return self.songs["al1"]
 
+    async def get_similar_songs(self, item_id, count=20):
+        # a plausible "similar" mix: a couple of other albums' tracks
+        return (self.songs["al2"] + self.songs["al3"])[:count]
+
+    async def get_top_songs(self, artist, count=20):
+        return self.songs["al0"][:count]
+
     async def scrobble(self, song_id, submission):
         pass
 

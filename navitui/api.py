@@ -157,6 +157,26 @@ class SubsonicClient:
         body = await self._get("getRandomSongs", size=size)
         return [Song.from_api(s) for s in body.get("randomSongs", {}).get("song", [])]
 
+    async def get_similar_songs(self, item_id: str, count: int = 20) -> list[Song]:
+        """Songs similar to a song/artist id (the seed for endless radio).
+        Prefers OpenSubsonic's `getSimilarSongs2`, falling back to the older
+        `getSimilarSongs` — servers without either just return an empty list."""
+        for endpoint, key in (("getSimilarSongs2", "similarSongs2"), ("getSimilarSongs", "similarSongs")):
+            try:
+                body = await self._get(endpoint, id=item_id, count=count)
+            except SubsonicError:
+                continue
+            songs = [Song.from_api(s) for s in body.get(key, {}).get("song", [])]
+            if songs:
+                return songs
+        return []
+
+    async def get_top_songs(self, artist: str, count: int = 20) -> list[Song]:
+        """An artist's top tracks by name (`getTopSongs`) — a decent radio
+        seed when similar-songs comes back empty."""
+        body = await self._get("getTopSongs", artist=artist, count=count)
+        return [Song.from_api(s) for s in body.get("topSongs", {}).get("song", [])]
+
     async def get_songs_by_albums(self, list_type: str, albums: int = 15) -> list[Song]:
         """Songs-first view of an album list: flatten the songs of the top N
         albums for `newest` / `recent` / `frequent`, keeping album order."""
