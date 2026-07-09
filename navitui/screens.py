@@ -205,7 +205,13 @@ class InputModal(ModalScreen):
 
 
 class LyricsModal(ModalScreen):
-    """Scrollable lyrics for the current track."""
+    """Lyrics for the current track — scrolling & karaoke-highlighted when the
+    server has timed (synced) lines, plain scrollback otherwise.
+
+    Synced lines are `(start_seconds, text)` tuples; the app heartbeat calls
+    `tick(position)` at 8fps to advance the highlighted line and keep it
+    centered. No timer of its own — one heartbeat drives everything.
+    """
 
     BINDINGS = [
         Binding("escape", "close_modal", show=False),
@@ -220,27 +226,77 @@ class LyricsModal(ModalScreen):
         background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
     }
     LyricsModal Static { background: $kit-modal-bg; }
+    LyricsModal #lyrics-head { height: 1; }
     LyricsModal #lyrics-body { height: auto; max-height: 32; scrollbar-size-vertical: 1; }
     LyricsModal #lyrics-text { height: auto; }
     """
 
-    def __init__(self, title: str, lyrics: str) -> None:
+    def __init__(
+        self, title: str, lyrics: str = "", synced: list[tuple[float, str]] | None = None
+    ) -> None:
         super().__init__()
         self._title = title
         self._lyrics = lyrics
+        self._synced = synced
+        self._current = -1  # index of the active synced line
 
     def compose(self) -> ComposeResult:
         from ricekit.widgets import KitScroll
 
         with Vertical(id="lyrics-box"):
-            yield Static(Text(self._title, style=f"bold {palette.sub}"))
+            with Horizontal(id="lyrics-head"):
+                yield Static(Text(self._title, style=f"bold {palette.sub}"), id="lyrics-title")
+                if self._synced:
+                    # subtle indicator that lines are timed (clock glyph)
+                    badge = Text(f"  {icons.CLOCK} ", style=palette.blue)
+                    badge.append("synced", style=palette.dim)
+                    yield Static(badge, id="lyrics-badge")
             with KitScroll(id="lyrics-body"):
-                yield Static(Text(f"\n{self._lyrics}\n", style=palette.text), id="lyrics-text")
+                yield Static(self._render_lyrics(), id="lyrics-text")
+
+    def _render_lyrics(self) -> Text:
+        if not self._synced:
+            return Text(f"\n{self._lyrics}\n", style=palette.text)
+        out = Text("\n")
+        for i, (_, line) in enumerate(self._synced):
+            if i == self._current:
+                style = f"bold {palette.blue}"
+            elif abs(i - self._current) == 1:
+                style = palette.sub
+            else:
+                style = palette.dim
+            out.append((line or " ") + "\n", style=style)
+        out.append("\n")
+        return out
 
     def on_mount(self) -> None:
         pop_in(self.query_one("#lyrics-box"))
         settle_pop_in(self, "#lyrics-box")
         self.query_one("#lyrics-body").focus()
+
+    def tick(self, position: float) -> None:
+        """Advance the highlighted synced line from playback position (called
+        by the app heartbeat). No-op for plain lyrics; never raises."""
+        if not self._synced:
+            return
+        idx = -1
+        for i, (start, _) in enumerate(self._synced):
+            if start <= position:
+                idx = i
+            else:
+                break
+        if idx == self._current:
+            return
+        self._current = idx
+        try:
+            self.query_one("#lyrics-text", Static).update(self._render_lyrics())
+            if idx >= 0:
+                body = self.query_one("#lyrics-body")
+                # +1 for the leading blank line; center the active line
+                target = max(0, (idx + 1) - body.size.height // 2)
+                body.scroll_to(y=target, animate=False)
+        except Exception:
+            return  # mid-teardown race
 
     def action_close_modal(self) -> None:
         self.dismiss(None)

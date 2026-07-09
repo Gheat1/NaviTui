@@ -515,6 +515,10 @@ class NaviTuiApp(KitApp):
                 now.set_class(self.player.active, "playing")
                 level = self.player.level
             now.tick(level)
+            # drive the synced-lyrics highlight off this one heartbeat
+            top = self.screen_stack[-1] if len(self.screen_stack) > 1 else None
+            if isinstance(top, LyricsModal) and self.player is not None:
+                top.tick(self.player.position)
             if self._zen:
                 self._render_zen_info()  # follow track changes in the splash
             groups = {w.group for w in self.workers if not w.is_finished}
@@ -1134,14 +1138,26 @@ class NaviTuiApp(KitApp):
 
     @work(exclusive=True, group="lyrics")
     async def _fetch_lyrics(self, song: Song) -> None:
-        try:
-            text = await self.client.get_lyrics(song.artist, song.title)
-        except Exception:
-            text = ""
-        if not text.strip():
+        # prefer timed (synced) lyrics; fall back to the plain getLyrics path
+        synced = None
+        get_synced = getattr(self.client, "get_synced_lyrics", None)
+        if get_synced is not None:
+            try:
+                synced = await get_synced(song.id)
+            except Exception:
+                synced = None
+        text = ""
+        if not synced:
+            try:
+                text = await self.client.get_lyrics(song.artist, song.title)
+            except Exception:
+                text = ""
+        if not synced and not text.strip():
             self.notify(f"no lyrics found for {song.title}", timeout=3)
             return
-        self.push_screen(LyricsModal(f"{song.title} — {song.artist}", text))
+        self.push_screen(
+            LyricsModal(f"{song.title} — {song.artist}", text, synced=synced)
+        )
 
     def action_share(self) -> None:
         song = self._target_song()

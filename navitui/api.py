@@ -212,6 +212,33 @@ class SubsonicClient:
         body = await self._get("getLyrics", artist=artist, title=title)
         return body.get("lyrics", {}).get("value", "") or ""
 
+    async def get_synced_lyrics(self, song_id: str) -> list[tuple[float, str]] | None:
+        """Timed lyrics for a song via OpenSubsonic `getLyricsBySongId`.
+
+        Returns a list of (start_seconds, text) lines when the server has
+        SYNCED structured lyrics, else None (no endpoint, unsynced only, or
+        nothing found) so the caller can fall back to plain `get_lyrics`.
+        """
+        try:
+            body = await self._get("getLyricsBySongId", id=song_id)
+        except (SubsonicError, httpx.HTTPError):
+            return None  # server lacks the endpoint / no match — fall back
+        structured = body.get("lyricsList", {}).get("structuredLyrics", [])
+        # prefer a synced track; ignore unsynced ones (plain path handles them)
+        for track in structured:
+            if not track.get("synced"):
+                continue
+            lines: list[tuple[float, str]] = []
+            for line in track.get("line", []):
+                start = line.get("start")
+                if start is None:
+                    continue
+                lines.append((start / 1000.0, line.get("value", "") or ""))
+            if lines:
+                lines.sort(key=lambda l: l[0])
+                return lines
+        return None
+
     async def create_share(self, item_id: str) -> str:
         """Public share link for a song/album (needs sharing enabled
         server-side). Returns the URL."""

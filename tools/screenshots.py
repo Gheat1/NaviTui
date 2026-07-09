@@ -232,6 +232,14 @@ class FakeClient:
     async def get_lyrics(self, artist, title):
         return "La la la\nDemo lyrics, verse two\nLa la la"
 
+    async def get_synced_lyrics(self, song_id):
+        return [
+            (0.0, "La la la"),
+            (2.5, "Demo lyrics, verse two"),
+            (5.0, "the highlight rides the beat"),
+            (7.5, "La la la"),
+        ]
+
     async def create_share(self, item_id):
         return f"https://demo.music.example/share/{item_id}"
 
