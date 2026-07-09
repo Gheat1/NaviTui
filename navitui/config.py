@@ -42,6 +42,7 @@ KEYBINDS = {
     "download_view":       "D",
     "download_all":        "ctrl+d",
     "offline_toggle":      "O",
+    "quality_cycle":       "Q",
     "playlist_add":        "p",
     "playlist_remove":     "P",
     "playlist_move_up":    "shift+up",
@@ -68,6 +69,8 @@ KEYBINDS = {
 DEFAULTS = {
     "replaygain": "album",        # album | track | no
     "gapless": "weak",            # yes | weak | no
+    "max_bitrate": 0,             # streaming cap in kbps (0 = original/unlimited)
+    "stream_format": "",          # transcode target: raw | mp3 | opus | "" original
     "notifications": True,        # desktop notification on track change
     "art_theming": True,          # tint the chrome with the cover's color
     "discord_rich_presence": False,
@@ -84,6 +87,14 @@ _TEMPLATE = """\
 
 # Gapless playback: "yes", "weak" (default; gapless when formats match), "no"
 #gapless = "weak"
+
+# Transcode cap for streaming on low bandwidth. Applies to network streams
+# only — offline pins (d / D / ctrl+d) always keep the original file.
+# max_bitrate: cap in kbps, 0 = original/unlimited. stream_format: transcode
+# target ("mp3", "opus", "raw", …) or "" for the server default/original.
+# Cycle presets at runtime with the quality keybind (see [keybinds] below).
+#max_bitrate = 0
+#stream_format = ""
 
 # Desktop notification on track change (toggle at runtime with N)
 #notifications = true

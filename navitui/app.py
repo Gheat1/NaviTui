@@ -67,6 +67,17 @@ SPEED_STEPS = [1.0, 1.25, 1.5, 1.75, 2.0, 0.75]
 # current track". Cycled by the sleep action; index 0 is always off.
 SLEEP_PRESETS = [0, 15, 30, 45, 60, -1]
 
+# Runtime streaming-quality presets (label, kbps cap, format). 0 kbps + "" is
+# original/untranscoded. Cycled with the quality keybind; the chosen cap only
+# affects streams started afterwards — a playing track keeps its URL.
+QUALITY_PRESETS = [
+    ("original", 0, ""),
+    ("320 kbps", 320, "mp3"),
+    ("192 kbps", 192, "mp3"),
+    ("96 kbps", 96, "opus"),
+]
+
+
 HELP_SECTIONS = [
     (
         "playback",
@@ -114,7 +125,7 @@ HELP_SECTIONS = [
             ("N", "toggle desktop notifications"),
             ("", "media keys work via MPRIS (linux)"),
             ("", "~/.config/navitui/player.toml: keybinds,"),
-            ("", "replaygain, gapless, discord presence"),
+            ("", "replaygain, gapless, bitrate, discord"),
         ],
     ),
     (
@@ -131,6 +142,7 @@ HELP_SECTIONS = [
             ("d / D", "download track / whole view for offline"),
             ("ctrl+d", "download the entire loaded library"),
             ("O", "offline mode — play only downloaded tracks"),
+            ("Q", "cycle stream quality  original → 320 → 192 → 96"),
             ("1-5", "rate track (same digit again clears)"),
             ("e / E", "go to track's album / artist"),
             ("L", "lyrics"),
@@ -186,6 +198,7 @@ class NaviTuiApp(KitApp):
         _kb("download_view", "download_view"),
         _kb("download_all", "download_all"),
         _kb("offline_toggle", "toggle_offline"),
+        _kb("quality_cycle", "cycle_quality"),
         _kb("playlist_add", "playlist_add"),
         _kb("playlist_remove", "playlist_remove"),
         _kb("playlist_move_up", "playlist_move(-1)"),
@@ -382,6 +395,8 @@ class NaviTuiApp(KitApp):
                     config["server"], config["username"], config["token"], config["salt"],
                     art_dir=self.dirs.cache_dir / "art",
                     audio_dir=self.dirs.cache_dir / "audio",
+                    max_bitrate=int(CONFIG["max_bitrate"]),
+                    stream_format=str(CONFIG["stream_format"]),
                 )
             else:
                 self.push_screen(
@@ -399,6 +414,8 @@ class NaviTuiApp(KitApp):
             config["server"], config["username"], config["token"], config["salt"],
             art_dir=self.dirs.cache_dir / "art",
             audio_dir=self.dirs.cache_dir / "audio",
+            max_bitrate=int(CONFIG["max_bitrate"]),
+            stream_format=str(CONFIG["stream_format"]),
         )
         self.notify("welcome to NaviTui ♪", timeout=4)
         self._start()
@@ -571,6 +588,9 @@ class NaviTuiApp(KitApp):
         text = Text()
         if self._offline:
             text.append(f"{icons.PLUG} offline  ", style=palette.yellow)
+        if self.client.max_bitrate:
+            # signal glyph + cap, shown only while streaming is capped
+            text.append(f"\uf012 {self.client.max_bitrate}k  ", style=palette.yellow)
         text.append(f"{self.client.username}@{host}", style=palette.dim)
         self.query_one("#status", Static).update(text)
 
@@ -2007,6 +2027,22 @@ class NaviTuiApp(KitApp):
         )
         if not self._offline:
             self._flush_mutations()  # back online: replay what we buffered
+
+    def action_cycle_quality(self) -> None:
+        """Step through the streaming-quality presets. Updates the cap used for
+        the next stream; a currently-playing track is left untouched."""
+        if self.client is None:
+            return
+        current = (int(self.client.max_bitrate), str(self.client.stream_format))
+        idx = next(
+            (i for i, (_, kb, fmt) in enumerate(QUALITY_PRESETS) if (kb, fmt) == current),
+            -1,
+        )
+        label, kbps, fmt = QUALITY_PRESETS[(idx + 1) % len(QUALITY_PRESETS)]
+        self.client.max_bitrate = kbps
+        self.client.stream_format = fmt
+        self._render_status()
+        self.notify(f"\uf012 stream quality: {label}", timeout=2)
 
     @work(group="mutate")
     async def _scrobble(self, song_id: str, submission: bool) -> None:

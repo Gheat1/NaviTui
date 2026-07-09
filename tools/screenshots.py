@@ -119,6 +119,8 @@ class FakeClient:
 
     server = "https://demo.music.example"
     username = "gheat"
+    max_bitrate = 0
+    stream_format = ""
 
     def __init__(self) -> None:
         self._art_dir = FAKE_HOME / "art"
