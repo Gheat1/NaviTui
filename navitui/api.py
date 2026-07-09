@@ -5,7 +5,10 @@ never the password itself. All calls go through `_get`, which unwraps the
 `subsonic-response` envelope and raises `SubsonicError` on failure.
 
 Cover art is fetched once and kept as files under the app cache dir, so art
-for anything you've already looked at renders instantly and offline.
+for anything you've already looked at renders instantly and offline. The same
+cache-first pattern extends to audio: `download_song` pins the original file
+next to the art, and `cached_stream` reports what is already on disk so
+playback can prefer a local copy over the network (see `SubsonicClient`).
 """
 
 from __future__ import annotations
@@ -42,12 +45,23 @@ def normalize_server(url: str) -> str:
 
 
 class SubsonicClient:
-    def __init__(self, server: str, username: str, token: str, salt: str, art_dir: Path) -> None:
+    def __init__(
+        self,
+        server: str,
+        username: str,
+        token: str,
+        salt: str,
+        art_dir: Path,
+        audio_dir: Path | None = None,
+    ) -> None:
         self.server = normalize_server(server)
         self.username = username
         self._token = token
         self._salt = salt
         self._art_dir = art_dir
+        # audio pins live next to the art cache; defaults beside it so callers
+        # that only pass art_dir still get a sane location
+        self._audio_dir = audio_dir if audio_dir is not None else art_dir.parent / "audio"
         self._http = httpx.AsyncClient(timeout=20, follow_redirects=True)
 
     async def close(self) -> None:
@@ -232,3 +246,61 @@ class SubsonicClient:
         tmp.write_bytes(resp.content)
         tmp.replace(path)
         return path
+
+    # ── audio cache (offline pins) ────────────────────────────────────
+    # Original files are pinned by id under the audio cache dir. We keep the
+    # id opaque (no suffix in the name): the server may transcode or the
+    # suffix may be unknown offline, and mpv probes the container regardless.
+    # `download_song` mirrors `cover_art` exactly — atomic .part→rename with
+    # the JSON-error content-type guard — so a killed download never leaves a
+    # half file that reads as "downloaded".
+    def _audio_path(self, song_id: str) -> Path:
+        return self._audio_dir / song_id.replace("/", "_")
+
+    def cached_stream(self, song_id: str) -> Path | None:
+        """The pinned file for this song, or None. Cheap exists-check that the
+        UI and offline-first playback lean on (like `cached_art`)."""
+        path = self._audio_path(song_id)
+        return path if path.exists() else None
+
+    async def download_song(self, song_id: str) -> Path:
+        """Pin the ORIGINAL file for `song_id` and return its path. Idempotent:
+        an already-pinned song returns instantly. Fetches the `download`
+        endpoint (untranscoded original) and falls back to `stream`."""
+        path = self._audio_path(song_id)
+        if path.exists():
+            return path
+        resp = await self._fetch_audio("download", song_id)
+        if resp is None:
+            resp = await self._fetch_audio("stream", song_id)
+        if resp is None:
+            raise SubsonicError("could not download song")
+        self._audio_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(resp.content)
+        tmp.replace(path)
+        return path
+
+    async def _fetch_audio(self, endpoint: str, song_id: str):
+        """GET an audio endpoint, returning the response or None on any error
+        (including the JSON error envelope some servers send instead of 4xx)."""
+        try:
+            resp = await self._http.get(
+                f"{self.server}/rest/{endpoint}", params=self._params(id=song_id)
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError:
+            return None
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            return None
+        return resp
+
+    def remove_pin(self, song_id: str) -> bool:
+        """Drop a pinned file (used by eviction / a future downloads panel).
+        Returns True if something was removed."""
+        path = self._audio_path(song_id)
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False

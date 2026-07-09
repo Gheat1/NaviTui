@@ -98,6 +98,9 @@ HELP_SECTIONS = [
             ("/", "search  (enter play · a queue · A play next)"),
             ("p", "add track to a playlist"),
             ("f", "star / unstar track"),
+            ("d / D", "download track / whole view for offline"),
+            ("ctrl+d", "download the entire loaded library"),
+            ("O", "offline mode — play only downloaded tracks"),
             ("1-5", "rate track (same digit again clears)"),
             ("e / E", "go to track's album / artist"),
             ("L", "lyrics"),
@@ -143,6 +146,10 @@ class NaviTuiApp(KitApp):
         _kb("queue_move_up", "queue_move(-1)"),
         _kb("queue_move_down", "queue_move(1)"),
         _kb("star", "star"),
+        _kb("download", "download"),
+        _kb("download_view", "download_view"),
+        _kb("download_all", "download_all"),
+        _kb("offline_toggle", "toggle_offline"),
         _kb("playlist_add", "playlist_add"),
         _kb("lyrics", "lyrics"),
         _kb("share", "share"),
@@ -212,6 +219,10 @@ class NaviTuiApp(KitApp):
         self._last_persist = 0.0
         self._queue_scrolled_to = -2
         self._zen = False
+        self._offline = False  # play/browse only what's pinned; skip the network
+        self._dl_total = 0
+        self._dl_done = 0
+        self._dl_failed = 0
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self):
@@ -251,6 +262,7 @@ class NaviTuiApp(KitApp):
         saved_view = state.get("view", "all-songs")
         if saved_view in VIEW_LABELS or saved_view.startswith("pl:"):
             self.view = saved_view
+        self._offline = bool(state.get("offline", False))
 
         configmod.write_template(self.dirs.config_file.parent)
         self.notifier = Notifier(bool(CONFIG["notifications"]))
@@ -294,6 +306,7 @@ class NaviTuiApp(KitApp):
                 self.client = SubsonicClient(
                     config["server"], config["username"], config["token"], config["salt"],
                     art_dir=self.dirs.cache_dir / "art",
+                    audio_dir=self.dirs.cache_dir / "audio",
                 )
             else:
                 self.push_screen(
@@ -310,6 +323,7 @@ class NaviTuiApp(KitApp):
         self.client = SubsonicClient(
             config["server"], config["username"], config["token"], config["salt"],
             art_dir=self.dirs.cache_dir / "art",
+            audio_dir=self.dirs.cache_dir / "audio",
         )
         self.notify("welcome to NaviTui ♪", timeout=4)
         self._start()
@@ -381,9 +395,11 @@ class NaviTuiApp(KitApp):
         if self.client is None:
             return
         host = self.client.server.split("://", 1)[-1]
-        self.query_one("#status", Static).update(
-            Text(f"{self.client.username}@{host}", style=palette.dim)
-        )
+        text = Text()
+        if self._offline:
+            text.append(f"{icons.PLUG} offline  ", style=palette.yellow)
+        text.append(f"{self.client.username}@{host}", style=palette.dim)
+        self.query_one("#status", Static).update(text)
 
     # ── the heartbeat (all constant animation) ────────────────────────
     def _heartbeat(self) -> None:
@@ -398,15 +414,16 @@ class NaviTuiApp(KitApp):
             now.tick(level)
             if self._zen:
                 self._render_zen_info()  # follow track changes in the splash
-            busy = any(
-                not w.is_finished
-                for w in self.workers
-                if w.group in ("lib", "songs")
-            )
+            groups = {w.group for w in self.workers if not w.is_finished}
             panel = self.query_one("#tracks-panel")
-            if busy:
-                panel.border_subtitle = f"{anim.spinner(int(now._tick))} refreshing"
-            elif panel.border_subtitle and "refreshing" in panel.border_subtitle:
+            spin = anim.spinner(int(now._tick))
+            if "download" in groups:
+                panel.border_subtitle = f"{spin} downloading {self._dl_done}/{self._dl_total}"
+            elif groups & {"lib", "songs"}:
+                panel.border_subtitle = f"{spin} refreshing"
+            elif panel.border_subtitle and (
+                "refreshing" in panel.border_subtitle or "downloading" in panel.border_subtitle
+            ):
                 count = self.query_one("#tracks-list", NavList).option_count
                 panel.border_subtitle = str(count) if count else None
         except Exception:
@@ -579,6 +596,8 @@ class NaviTuiApp(KitApp):
         marker = anim.NOTE_FRAMES[0] if is_current else "·"
         row.append(f" {marker} ", style=palette.blue if is_current else palette.vfaint)
         row.append(s.title, style=f"bold {palette.blue}" if is_current else palette.text)
+        if self.client is not None and self.client.cached_stream(s.id):
+            row.append(f" {icons.CHECK}", style=palette.green)  # pinned for offline
         if s.starred:
             row.append(f" {icons.STAR}", style=palette.yellow)
         if s.user_rating:
@@ -639,6 +658,17 @@ class NaviTuiApp(KitApp):
         self.queue.set_songs(songs, start)
         self._play_current()
 
+    def _stream_source(self, song: Song) -> str | None:
+        """Where to play `song` from: a pinned local file if we have one,
+        else the server stream URL. In offline mode a missing pin means the
+        track is unplayable (None)."""
+        local = self.client.cached_stream(song.id) if self.client else None
+        if local is not None:
+            return str(local)
+        if self._offline:
+            return None
+        return self.client.stream_url(song.id) if self.client else None
+
     def _play_current(self, resume_at: float = 0.0) -> None:
         song = self.queue.current
         now = self.query_one("#now", NowPlaying)
@@ -648,7 +678,27 @@ class NaviTuiApp(KitApp):
             self._tint_from_art(None)
             self._render_queue()
             return
-        self.player.play(self.client.stream_url(song.id), start=resume_at)
+        source = self._stream_source(song)
+        if source is None:
+            # offline and not pinned — skip forward to the next playable track,
+            # scanning the queue at most once so an all-unpinned queue stops
+            # rather than spinning
+            for _ in range(len(self.queue.songs)):
+                nxt = self.queue.advance(natural=False)
+                if nxt is None:
+                    break
+                source = self._stream_source(nxt)
+                if source is not None:
+                    song = nxt
+                    break
+            if source is None:
+                self.notify("offline: nothing downloaded to play", timeout=3)
+                self.player.stop()
+                now.set_song(None)
+                now.set_playing(False)
+                self._render_queue()
+                return
+        self.player.play(source, start=resume_at)
         now.set_song(song)
         now.set_progress(resume_at, song.duration)
         self._scrobbled = False
@@ -1095,6 +1145,80 @@ class NaviTuiApp(KitApp):
             self.notify(f"couldn't {'star' if star else 'unstar'}: {e}", severity="warning")
         finally:
             self._mutations -= 1
+
+    # ── offline downloads ─────────────────────────────────────────────
+    def action_download(self) -> None:
+        """Pin the highlighted (or playing) track for offline."""
+        song = self._target_song()
+        if song is None:
+            self.notify("highlight a track to download", timeout=2)
+            return
+        if self.client is not None and self.client.cached_stream(song.id):
+            self.notify(f"already downloaded: {song.title}", timeout=2)
+            return
+        self._download_songs([song], label=song.title)
+
+    def action_download_view(self) -> None:
+        """Pin every track in the current tracks pane / playlist."""
+        if not self._songs:
+            self.notify("nothing here to download", timeout=2)
+            return
+        title = self.query_one("#tracks-panel").border_title or "view"
+        self._download_songs(list(self._songs), label=str(title))
+
+    def action_download_all(self) -> None:
+        """Pin the whole loaded library (the all-tracks cache)."""
+        cached = self.dirs.read_cache("all-songs")
+        songs = [Song.from_dict(s) for s in cached.get("songs", [])] if cached else list(self._songs)
+        if not songs:
+            self.notify("library not loaded yet — open 'all tracks' first", timeout=3)
+            return
+        self._download_songs(songs, label="library")
+
+    @work(exclusive=True, group="download")
+    async def _download_songs(self, songs: list[Song], label: str) -> None:
+        """Download a batch of songs to the audio cache. Runs off the UI
+        thread; progress rides the heartbeat spinner (group='download'),
+        completion/failure is a notify. Already-pinned songs are skipped
+        cheaply so re-runs are near-instant."""
+        if self.client is None:
+            return
+        pending = [s for s in songs if not self.client.cached_stream(s.id)]
+        if not pending:
+            self.notify(f"{label}: already downloaded", timeout=2)
+            return
+        self._dl_total = len(pending)
+        self._dl_done = 0
+        self._dl_failed = 0
+        if len(pending) > 1:
+            self.notify(f"downloading {label} · {len(pending)} tracks", timeout=3)
+        for song in pending:
+            try:
+                await self.client.download_song(song.id)
+            except Exception:
+                self._dl_failed += 1
+            self._dl_done += 1
+            # re-render so the ✓ appears as each track lands
+            self._refresh_song_markers()
+        ok = self._dl_done - self._dl_failed
+        if self._dl_failed:
+            self.notify(
+                f"downloaded {ok}/{self._dl_total} · {self._dl_failed} failed",
+                severity="warning", timeout=5,
+            )
+        else:
+            self.notify(f"downloaded {label}" if ok == 1 else f"downloaded {ok} tracks", timeout=3)
+        self._refresh_song_markers()
+
+    def action_toggle_offline(self) -> None:
+        self._offline = not self._offline
+        self.dirs.save_state({"offline": self._offline})
+        self._render_status()
+        self.notify(
+            "offline mode — playing only downloaded tracks" if self._offline
+            else "online mode",
+            timeout=3,
+        )
 
     @work(group="mutate")
     async def _scrobble(self, song_id: str, submission: bool) -> None:
