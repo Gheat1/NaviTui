@@ -65,6 +65,7 @@ KEYBINDS = {
     "theme_cycle":         "t",
     "theme_pick":          "T",
     "zen":                 "z",
+    "command_palette":     "ctrl+p",
     "help":                "question_mark",
     "quit":                "q",
 }
