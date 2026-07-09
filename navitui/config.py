@@ -51,6 +51,7 @@ DEFAULTS = {
     "replaygain": "album",        # album | track | no
     "gapless": "weak",            # yes | weak | no
     "notifications": True,        # desktop notification on track change
+    "art_theming": True,          # tint the chrome with the cover's color
     "discord_rich_presence": False,
     "discord_app_id": "",         # discord.com/developers/applications
 }
@@ -66,6 +67,10 @@ _TEMPLATE = """\
 
 # Desktop notification on track change (toggle at runtime with N)
 #notifications = true
+
+# Tint the UI with a color pulled from the current song's cover art.
+# Truecolor terminals only; the "system" (ANSI) theme leaves this inert.
+#art_theming = true
 
 # Discord rich presence (needs `pip install pypresence` and an application id
 # from discord.com/developers/applications)
