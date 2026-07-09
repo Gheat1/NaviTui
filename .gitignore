@@ -6,3 +6,4 @@ build/
 assets/*.svg
 assets/*.png
 !assets/shot-*.png
+memory/
