@@ -29,7 +29,14 @@ os.environ["NAVITUI_ART"] = "halfcell"
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-from navitui.models import Album, Artist, Playlist, SearchResults, Song  # noqa: E402
+from navitui.models import (  # noqa: E402
+    Album,
+    Artist,
+    PodcastChannel,
+    Playlist,
+    SearchResults,
+    Song,
+)
 
 ASSETS = REPO / "assets"
 
@@ -177,6 +184,33 @@ class FakeClient:
         return [
             Playlist(id="pl1", name="late night coding", song_count=14, duration=3300, owner="gheat"),
             Playlist(id="pl2", name="gym (do not judge)", song_count=9, duration=2100, owner="gheat"),
+        ]
+
+    async def get_podcasts(self):
+        # two channels, a handful of episodes each — episodes are plain Songs
+        # keyed on their streamId, so they play like any track
+        channels = []
+        for ci, (title, cover) in enumerate(
+            [("Terminal Velocity", "cov0"), ("Reverb & Static", "cov3")]
+        ):
+            channel = PodcastChannel(id=f"pc{ci}", title=title, cover_art=cover, episode_count=3)
+            episodes = [
+                Song(
+                    id=f"ep{ci}-{ei}", title=f"Ep {ei + 1}: {name}", artist=title,
+                    album=title, duration=1800 + ei * 420, cover_art=cover,
+                )
+                for ei, name in enumerate(["The Cold Open", "Deep Dive", "Listener Mail"])
+            ]
+            channels.append((channel, episodes))
+        return channels
+
+    async def get_internet_radio_stations(self):
+        # direct-URL stations: stream_url is set so mpv opens them straight
+        return [
+            Song(id="radio:r1", title="Lofi Beats FM", artist="internet radio",
+                 stream_url=str(self._tone)),
+            Song(id="radio:r2", title="Synthwave Nightdrive", artist="internet radio",
+                 stream_url=str(self._tone)),
         ]
 
     async def get_playlist_songs(self, playlist_id):

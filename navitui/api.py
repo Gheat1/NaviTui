@@ -20,7 +20,15 @@ from pathlib import Path
 
 import httpx
 
-from navitui.models import Album, Artist, Playlist, SearchResults, Song
+from navitui.models import (
+    Album,
+    Artist,
+    Playlist,
+    PodcastChannel,
+    RadioStation,
+    SearchResults,
+    Song,
+)
 
 API_VERSION = "1.16.1"
 CLIENT_NAME = "navitui"
@@ -210,6 +218,64 @@ class SubsonicClient:
             if len(batch) < page:
                 break
         return songs[:max_songs]
+
+    # ── podcasts & internet radio ─────────────────────────────────────
+    @staticmethod
+    def _episode_song(ep: dict, channel_title: str) -> Song | None:
+        """A podcast episode as a playable Song. `streamId` is the id the
+        `stream`/`download` endpoints accept, so we key the Song on it and
+        everything (playback, offline pins) works unchanged. Episodes still
+        downloading / errored have no streamId — those are dropped."""
+        stream_id = ep.get("streamId")
+        if not stream_id:
+            return None
+        return Song(
+            id=str(stream_id),
+            title=ep.get("title", "?"),
+            artist=channel_title,  # the channel reads as the "artist"
+            album=channel_title,
+            year=ep.get("year"),
+            duration=int(ep.get("duration", 0) or 0),
+            cover_art=ep.get("coverArt"),
+            suffix=ep.get("suffix", ""),
+            bit_rate=ep.get("bitRate"),
+        )
+
+    async def get_podcasts(self) -> list[tuple[PodcastChannel, list[Song]]]:
+        """Every subscribed channel with its episodes flattened into playable
+        Songs (`getPodcasts` with `includeEpisodes`). Newest episode first."""
+        body = await self._get("getPodcasts", includeEpisodes="true")
+        out: list[tuple[PodcastChannel, list[Song]]] = []
+        for ch in body.get("podcasts", {}).get("channel", []):
+            channel = PodcastChannel.from_api(ch)
+            episodes = [
+                s for ep in ch.get("episode", [])
+                if (s := self._episode_song(ep, channel.title)) is not None
+            ]
+            out.append((channel, episodes))
+        return out
+
+    async def get_internet_radio_stations(self) -> list[Song]:
+        """Internet-radio stations as playable Songs. The station's direct
+        `streamUrl` rides on `Song.stream_url` so mpv opens it straight,
+        bypassing the Subsonic stream endpoint (see `_stream_source`)."""
+        body = await self._get("getInternetRadioStations")
+        stations = body.get("internetRadioStations", {}).get("internetRadioStation", [])
+        songs: list[Song] = []
+        for st in stations:
+            station = RadioStation.from_api(st)
+            if not station.stream_url:
+                continue
+            songs.append(
+                Song(
+                    id=f"radio:{station.id}",
+                    title=station.name,
+                    artist="internet radio",
+                    album=station.home_url,
+                    stream_url=station.stream_url,
+                )
+            )
+        return songs
 
     # ── playback side-channel ─────────────────────────────────────────
     def stream_url(self, song_id: str) -> str:

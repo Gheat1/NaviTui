@@ -87,6 +87,10 @@ class Song:
     bit_rate: int | None = None
     starred: bool = False
     user_rating: int = 0
+    # a direct playable URL, set for internet-radio stations that mpv opens
+    # straight (podcast episodes stream by id like any track, so this is None
+    # for them). Kept out of `from_api` since it never comes from song JSON.
+    stream_url: str | None = None
 
     @classmethod
     def from_api(cls, d: dict) -> "Song":
@@ -139,6 +143,61 @@ class Playlist:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Playlist":
+        return cls(**d)
+
+
+@dataclass
+class PodcastChannel:
+    """A subscribed podcast feed. Episodes are `Song`s (see
+    `SubsonicClient.get_podcasts`) so they flow through the tracks pane and
+    queue unchanged."""
+
+    id: str
+    title: str
+    cover_art: str | None = None
+    episode_count: int = 0
+
+    @classmethod
+    def from_api(cls, d: dict) -> "PodcastChannel":
+        return cls(
+            id=str(d["id"]),
+            title=d.get("title") or d.get("url") or "?",
+            cover_art=d.get("coverArt"),
+            episode_count=len(d.get("episode", []) or []),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PodcastChannel":
+        return cls(**d)
+
+
+@dataclass
+class RadioStation:
+    """An internet-radio station: a name and a direct stream URL that mpv
+    opens without the Subsonic stream endpoint."""
+
+    id: str
+    name: str
+    stream_url: str
+    home_url: str = ""
+
+    @classmethod
+    def from_api(cls, d: dict) -> "RadioStation":
+        return cls(
+            id=str(d["id"]),
+            name=d.get("name", "?"),
+            stream_url=d.get("streamUrl", ""),
+            home_url=d.get("homePageUrl", "") or d.get("homepageUrl", ""),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RadioStation":
         return cls(**d)
 
 
