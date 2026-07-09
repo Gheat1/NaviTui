@@ -102,6 +102,8 @@ HELP_SECTIONS = [
             ("h / l", "previous / next panel"),
             ("/", "search  (enter play · a queue · A play next)"),
             ("\\", "filter tracks pane  (type to narrow · esc clears)"),
+            ("v", "select mode  (space toggles rows · esc exits)"),
+            ("", "then a/A/p/f/d act on the whole selection"),
             ("p", "add track to a playlist"),
             ("f", "star / unstar track"),
             ("d / D", "download track / whole view for offline"),
@@ -153,6 +155,7 @@ class NaviTuiApp(KitApp):
         _kb("queue_move_up", "queue_move(-1)"),
         _kb("queue_move_down", "queue_move(1)"),
         _kb("star", "star"),
+        _kb("select_mode", "toggle_select_mode"),
         _kb("start_radio", "start_radio"),
         _kb("radio_toggle", "toggle_radio"),
         _kb("download", "download"),
@@ -233,6 +236,12 @@ class NaviTuiApp(KitApp):
         self._filtering = False
         self._filter_query = ""
         self._filtered: list[Song] = []
+        # multi-select: a set of song ids the bulk actions operate on. An
+        # explicit `_select_mode` (toggled with `v`) turns `space` into
+        # toggle-current-and-advance over the tracks pane; the selection is
+        # scoped to the tracks pane and cleared whenever its rows change.
+        self._select_mode = False
+        self._selected: set[str] = set()
         # playback bookkeeping
         self._scrobbled = False
         self._end_failures = 0
@@ -640,9 +649,11 @@ class NaviTuiApp(KitApp):
 
     def _show_songs(self, songs: list[Song], title: str) -> None:
         self._songs = songs
-        # a fresh view supersedes any active filter (the rows changed under it)
+        # a fresh view supersedes any active filter / selection (the rows
+        # changed under both)
         if self._filtering:
             self._exit_filter()
+        self._clear_selection()
         panel = self.query_one("#tracks-panel")
         panel.border_title = title
         self._fill("#tracks-list", [self._song_row(s) for s in songs], "#tracks-panel")
@@ -728,8 +739,12 @@ class NaviTuiApp(KitApp):
         current = self.queue.current
         is_current = current is not None and s.id == current.id
         row = Text(no_wrap=True, overflow="ellipsis")
-        marker = anim.NOTE_FRAMES[0] if is_current else "·"
-        row.append(f" {marker} ", style=palette.blue if is_current else palette.vfaint)
+        if s.id in self._selected:
+            # a selected row wins the marker column: a filled check
+            row.append(f" {icons.CHECK_CIRCLE} ", style=palette.green)
+        else:
+            marker = anim.NOTE_FRAMES[0] if is_current else "·"
+            row.append(f" {marker} ", style=palette.blue if is_current else palette.vfaint)
         row.append(s.title, style=f"bold {palette.blue}" if is_current else palette.text)
         if self.client is not None and self.client.cached_stream(s.id):
             row.append(f" {icons.CHECK}", style=palette.green)  # pinned for offline
@@ -803,6 +818,25 @@ class NaviTuiApp(KitApp):
         self._render_filter_bar()
 
     def on_key(self, event) -> None:
+        # select mode: intercept `space` (globally play/pause) into
+        # toggle-current-and-advance, but ONLY while our mode is active and the
+        # tracks pane is focused — so we never hijack the global bind elsewhere.
+        # Written before the filter branch and guarded by its own flag so it
+        # composes with type-to-filter and any other on_key consumer.
+        if self._select_mode:
+            focused = self.focused
+            in_tracks = focused is not None and focused.id == "tracks-list"
+            if event.key == "escape":
+                self._exit_select_mode()
+                event.prevent_default()
+                event.stop()
+                return
+            if in_tracks and event.key == "space":
+                self._toggle_current_selection()
+                event.prevent_default()
+                event.stop()
+                return
+            # j/k/g/G/arrows fall through so navigation still works
         if not self._filtering:
             return
         key = event.key
@@ -861,6 +895,73 @@ class NaviTuiApp(KitApp):
         panel = self.query_one("#tracks-panel")
         panel.border_subtitle = str(len(self._songs)) if self._songs else None
         self._fill("#tracks-list", [self._song_row(s) for s in self._songs])
+
+    # ── multi-select (bulk actions over a set of song ids) ─────────────
+    # `v` toggles select mode; in it, `space` toggles the highlighted row and
+    # moves down (j/k still navigate). The selection is a set of ids, so it
+    # survives re-renders (marker, star, download) and maps onto whichever
+    # view — filtered or full — the tracks pane is showing. When the underlying
+    # list changes (new view / refresh) the set is cleared via `_clear_selection`.
+    def action_toggle_select_mode(self) -> None:
+        if self._select_mode:
+            self._exit_select_mode()
+            return
+        if not self._songs:
+            self.notify("nothing here to select", timeout=2)
+            return
+        self.query_one("#tracks-list", ClickList).focus()
+        self._select_mode = True
+        self.notify("select mode — space toggles rows, esc exits", timeout=3)
+        self._render_select_subtitle()
+
+    def _exit_select_mode(self) -> None:
+        if not self._select_mode:
+            return
+        self._select_mode = False
+        self._selected.clear()
+        self._refresh_song_markers()
+        # let the heartbeat reset the subtitle (unless filter owns it)
+        if not self._filtering:
+            panel = self.query_one("#tracks-panel")
+            panel.border_subtitle = str(len(self._songs)) if self._songs else None
+        else:
+            self._render_filter_bar()
+
+    def _clear_selection(self) -> None:
+        """Drop the selection when the rows change under it (view/refresh)."""
+        self._select_mode = False
+        self._selected.clear()
+
+    def _toggle_current_selection(self) -> None:
+        ol = self.query_one("#tracks-list", NavList)
+        view = self._tracks_view()
+        if ol.highlighted is None or ol.highlighted >= len(view):
+            return
+        song = view[ol.highlighted]
+        if song.id in self._selected:
+            self._selected.discard(song.id)
+        else:
+            self._selected.add(song.id)
+        # re-render just this row's marker, then step down for fast tagging
+        self._refresh_song_markers()
+        if ol.highlighted < len(view) - 1:
+            ol.highlighted += 1
+        self._render_select_subtitle()
+
+    def _render_select_subtitle(self) -> None:
+        # don't fight the filter bar for the subtitle while filtering
+        if self._filtering:
+            self._render_filter_bar()
+            return
+        panel = self.query_one("#tracks-panel")
+        n = len(self._selected)
+        panel.border_subtitle = f"{icons.CHECK_CIRCLE} {n} selected"
+
+    def _selected_songs(self) -> list[Song]:
+        """The selected songs, in the order they appear in the current view."""
+        if not self._selected:
+            return []
+        return [s for s in self._tracks_view() if s.id in self._selected]
 
     # ── playback ──────────────────────────────────────────────────────
     def _shuffle_everything(self) -> None:
@@ -1174,6 +1275,18 @@ class NaviTuiApp(KitApp):
         focused = self.focused
         if focused is None or focused.id != "tracks-list":
             return
+        selected = self._selected_songs()
+        if selected:  # bulk: queue the whole selection
+            if play_next:
+                self.queue.add_next(selected)
+            else:
+                self.queue.add(selected)
+            self._render_queue()
+            self._persist_queue()
+            self.notify(
+                f"queued {'next: ' if play_next else ''}{len(selected)} tracks", timeout=2
+            )
+            return
         ol = self.query_one("#tracks-list", NavList)
         view = self._tracks_view()
         if ol.highlighted is None or ol.highlighted >= len(view):
@@ -1232,10 +1345,18 @@ class NaviTuiApp(KitApp):
         return None
 
     def action_playlist_add(self) -> None:
-        song = self._highlighted_song()
-        if song is None:
+        # bulk when a selection exists and the tracks pane is focused, else the
+        # single highlighted track — same PickerModal flow either way
+        selected = (
+            self._selected_songs()
+            if self.focused is not None and self.focused.id == "tracks-list"
+            else []
+        )
+        songs = selected or ([s] if (s := self._highlighted_song()) else [])
+        if not songs:
             self.notify("highlight a track first (tracks or queue panel)", timeout=3)
             return
+        label = songs[0].title if len(songs) == 1 else f"{len(songs)} tracks"
         options = [
             Option(Text(f" {icons.LIST} {p.name}", style=palette.text), id=f"pl:{p.id}")
             for p in self._playlists
@@ -1248,45 +1369,51 @@ class NaviTuiApp(KitApp):
             if choice == "pl-new":
                 self.push_screen(
                     InputModal("new playlist", placeholder="name"),
-                    lambda name: self._playlist_create(name, song) if name else None,
+                    lambda name: self._playlist_create(name, songs) if name else None,
                 )
             else:
                 pid = choice.split(":", 1)[1]
-                self._playlist_append(pid, song)
+                self._playlist_append(pid, songs)
 
-        self.push_screen(PickerModal(f"add “{song.title}” to…", options), picked)
+        self.push_screen(PickerModal(f"add “{label}” to…", options), picked)
 
     def _playlist_created_name(self, name: str | None) -> None:
         if name:
-            self._playlist_create(name, None)
+            self._playlist_create(name, [])
 
     @work(group="mutate")
-    async def _playlist_create(self, name: str, song: Song | None) -> None:
+    async def _playlist_create(self, name: str, songs: list[Song]) -> None:
         self._mutations += 1
         try:
-            await self.client.create_playlist(name, [song.id] if song else [])
+            await self.client.create_playlist(name, [s.id for s in songs])
         except Exception as e:
             self.notify(f"couldn't create playlist: {e}", severity="error", timeout=5)
             return
         finally:
             self._mutations -= 1
-        self.notify(
-            f"created “{name}”" + (f" with {song.title}" if song else ""), timeout=3
-        )
+        if not songs:
+            detail = ""
+        elif len(songs) == 1:
+            detail = f" with {songs[0].title}"
+        else:
+            detail = f" with {len(songs)} tracks"
+        self.notify(f"created “{name}”" + detail, timeout=3)
         self._load_playlists()
 
     @work(group="mutate")
-    async def _playlist_append(self, playlist_id: str, song: Song) -> None:
+    async def _playlist_append(self, playlist_id: str, songs: list[Song]) -> None:
         self._mutations += 1
         try:
-            await self.client.add_to_playlist(playlist_id, [song.id])
+            await self.client.add_to_playlist(playlist_id, [s.id for s in songs])
         except Exception as e:
             self.notify(f"couldn't add to playlist: {e}", severity="error", timeout=5)
             return
         finally:
             self._mutations -= 1
         playlist = next((p for p in self._playlists if p.id == playlist_id), None)
-        self.notify(f"added to “{playlist.name if playlist else 'playlist'}”", timeout=3)
+        name = playlist.name if playlist else "playlist"
+        detail = songs[0].title if len(songs) == 1 else f"{len(songs)} tracks"
+        self.notify(f"added {detail} to “{name}”", timeout=3)
         # the playlist's cached songs are stale now
         try:
             (self.dirs.cache_dir / f"playlist-songs-{playlist_id}.json").unlink()
@@ -1469,6 +1596,22 @@ class NaviTuiApp(KitApp):
 
     # ── starring ──────────────────────────────────────────────────────
     def action_star(self) -> None:
+        selected = self._selected_songs()
+        if selected and self.focused is not None and self.focused.id == "tracks-list":
+            # bulk: star every selected track (idempotent — always set on, so a
+            # mixed selection ends up uniformly starred)
+            for song in selected:
+                if not song.starred:
+                    song.starred = True
+                    self._star(song.id, "song", True)
+            self._refresh_song_markers()
+            self._render_queue()
+            current = self.queue.current
+            if current is not None and current.id in self._selected:
+                current.starred = True
+                self.query_one("#now", NowPlaying).song = current
+            self.notify(f"starred {len(selected)} tracks", timeout=2)
+            return
         song = self._highlighted_song()
         if song is None:
             return
@@ -1502,7 +1645,15 @@ class NaviTuiApp(KitApp):
 
     # ── offline downloads ─────────────────────────────────────────────
     def action_download(self) -> None:
-        """Pin the highlighted (or playing) track for offline."""
+        """Pin the selection (if any) or the highlighted/playing track."""
+        selected = (
+            self._selected_songs()
+            if self.focused is not None and self.focused.id == "tracks-list"
+            else []
+        )
+        if selected:
+            self._download_songs(selected, label=f"{len(selected)} tracks")
+            return
         song = self._target_song()
         if song is None:
             self.notify("highlight a track to download", timeout=2)

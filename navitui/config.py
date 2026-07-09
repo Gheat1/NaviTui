@@ -33,6 +33,7 @@ KEYBINDS = {
     "queue_move_up":       "ctrl+up",
     "queue_move_down":     "ctrl+down",
     "star":                "f",
+    "select_mode":         "v",
     "start_radio":         "i",
     "radio_toggle":        "I",
     "download":            "d",
