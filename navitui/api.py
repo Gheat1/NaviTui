@@ -53,11 +53,18 @@ class SubsonicClient:
         salt: str,
         art_dir: Path,
         audio_dir: Path | None = None,
+        max_bitrate: int = 0,
+        stream_format: str = "",
     ) -> None:
         self.server = normalize_server(server)
         self.username = username
         self._token = token
         self._salt = salt
+        # Streaming transcode cap (network only — downloads pin originals).
+        # Mutable so a runtime toggle can retune later streams; a track that is
+        # already playing keeps its URL until the next `stream_url` call.
+        self.max_bitrate = max_bitrate
+        self.stream_format = stream_format
         self._art_dir = art_dir
         # audio pins live next to the art cache; defaults beside it so callers
         # that only pass art_dir still get a sane location
@@ -213,7 +220,16 @@ class SubsonicClient:
 
     # ── playback side-channel ─────────────────────────────────────────
     def stream_url(self, song_id: str) -> str:
-        params = "&".join(f"{k}={v}" for k, v in self._params(id=song_id).items())
+        # maxBitRate/format only when set — 0/"" means original quality, so we
+        # omit them and let the server serve the untranscoded file. Downloads
+        # go through `download_song`, which never touches these, so offline
+        # pins stay full quality regardless of the streaming cap.
+        extra = {}
+        if self.max_bitrate:
+            extra["maxBitRate"] = self.max_bitrate
+        if self.stream_format:
+            extra["format"] = self.stream_format
+        params = "&".join(f"{k}={v}" for k, v in self._params(id=song_id, **extra).items())
         return f"{self.server}/rest/stream?{params}"
 
     async def scrobble(self, song_id: str, submission: bool) -> None:
