@@ -349,7 +349,11 @@ class NaviTuiApp(KitApp):
             self.player.volume if self.player else 100,
             str(art) if art else None,
         )
-        self.discord.track(song, playing)
+        self.discord.track(
+            song, playing,
+            self.player.position if self.player else 0.0,
+            float(song.duration) if song else 0.0,
+        )
         if track_change and song is not None:
             self.notifier.track(song, art)
 

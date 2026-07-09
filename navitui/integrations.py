@@ -76,7 +76,13 @@ class DiscordPresence:
         except Exception:
             self._rpc = None
 
-    def track(self, song: Song | None, playing: bool) -> None:
+    def track(
+        self,
+        song: Song | None,
+        playing: bool,
+        position: float = 0.0,
+        duration: float = 0.0,
+    ) -> None:
         if self._rpc is None:
             return
         now = time.monotonic()
@@ -87,11 +93,25 @@ class DiscordPresence:
             if song is None:
                 self._rpc.clear()
                 return
-            self._rpc.update(
-                details=song.title,
-                state=f"{song.artist}{' · paused' if not playing else ''}",
-                large_text=song.album or "NaviTui",
-            )
+            fields: dict = {
+                "details": song.title,
+                "state": f"{song.artist}{' · paused' if not playing else ''}",
+                "large_text": song.album or "NaviTui",
+            }
+            # a live progress bar: elapsed → total, only while actually playing
+            if playing and duration > 0:
+                start = int(time.time() - position)
+                fields["start"] = start
+                fields["end"] = start + int(duration)
+            # only offer art/buttons when we have something Discord will accept
+            # (asset key or public https url); local cache paths don't qualify.
+            image = _presence_image(song)
+            if image is not None:
+                fields["large_image"] = image
+            button = _presence_button(song)
+            if button is not None:
+                fields["buttons"] = [button]
+            self._rpc.update(**fields)
         except Exception:
             self._rpc = None  # discord went away; stay quiet
 
@@ -102,3 +122,22 @@ class DiscordPresence:
             except Exception:
                 pass
             self._rpc = None
+
+
+def _presence_image(song: Song) -> str | None:
+    """Discord's large_image wants an uploaded asset key or a public https
+    URL. Cover art lives in a local cache the client can't reach, so unless
+    a caller wires up a real url we have nothing valid to hand over."""
+    url = getattr(song, "art_url", None)
+    if isinstance(url, str) and url.startswith("https://"):
+        return url
+    return None
+
+
+def _presence_button(song: Song) -> dict | None:
+    """A share button needs a reachable https link; omit when absent rather
+    than ship Discord a URL it will reject."""
+    url = getattr(song, "share_url", None)
+    if isinstance(url, str) and url.startswith("https://"):
+        return {"label": "Listen", "url": url}
+    return None
