@@ -707,20 +707,35 @@ class NaviTuiApp(KitApp):
         art = None
         if song is not None and song.cover_art and self.client is not None:
             art = self.client.cached_art(song.cover_art)
-        self.mpris.update(
-            song, playing,
-            self.player.position if self.player else 0.0,
-            self.player.volume if self.player else 100,
-            str(art) if art else None,
-        )
-        self.discord.track(
-            song, playing,
-            self.player.position if self.player else 0.0,
-            float(song.duration) if song else 0.0,
-        )
+        # each fan-out is isolated: one integration raising (e.g. a dbus
+        # marshalling error) must never stop the others — notably it must not
+        # swallow the track-change notification.
+        try:
+            self.mpris.update(
+                song, playing,
+                self.player.position if self.player else 0.0,
+                self.player.volume if self.player else 100,
+                str(art) if art else None,
+            )
+        except Exception:
+            pass
+        try:
+            self.discord.track(
+                song, playing,
+                self.player.position if self.player else 0.0,
+                float(song.duration) if song and song.duration else 0.0,
+            )
+        except Exception:
+            pass
         if track_change and song is not None:
-            self.notifier.track(song, art)
-        self.remote.publish(self._remote_snapshot())
+            try:
+                self.notifier.track(song, art)
+            except Exception:
+                pass
+        try:
+            self.remote.publish(self._remote_snapshot())
+        except Exception:
+            pass
 
     def _render_status(self) -> None:
         if self.client is None:

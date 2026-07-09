@@ -222,11 +222,15 @@ class Mpris:
             player.metadata = {}
         else:
             meta = {
+                # dbus can't serialize None — coerce every string/number field
+                # (a track with no album/title/duration would otherwise raise
+                # here and abort the whole _announce fan-out, killing
+                # notifications + discord for that track change)
                 "mpris:trackid": Variant("o", f"/dev/navitui/track/{abs(hash(song.id))}"),
-                "mpris:length": Variant("x", int(song.duration * 1_000_000)),
-                "xesam:title": Variant("s", song.title),
+                "mpris:length": Variant("x", int((song.duration or 0) * 1_000_000)),
+                "xesam:title": Variant("s", song.title or ""),
                 "xesam:artist": Variant("as", [song.artist] if song.artist else []),
-                "xesam:album": Variant("s", song.album),
+                "xesam:album": Variant("s", song.album or ""),
             }
             if art_path:
                 meta["mpris:artUrl"] = Variant("s", f"file://{art_path}")

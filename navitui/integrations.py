@@ -49,6 +49,7 @@ class Notifier:
         self._bus = None
         self._controls: dict[str, Callable[[], None]] = {}
         self._last_id = 0
+        self._tasks: set = set()  # hold refs to in-flight Notify sends
 
     def toggle(self) -> bool:
         self.enabled = not self.enabled
@@ -182,7 +183,10 @@ class Notifier:
                 pass
 
         try:
-            asyncio.get_running_loop().create_task(_send())
+            # keep a reference: an un-referenced task can be GC'd mid-flight
+            task = asyncio.get_running_loop().create_task(_send())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         except RuntimeError:
             pass
 
