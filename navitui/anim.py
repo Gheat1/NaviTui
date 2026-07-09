@@ -152,10 +152,21 @@ class VizModel:
         self.energy = 0.0
         self._t = seed
 
-    def tick(self) -> None:
+    def tick(self, level: float | None = None) -> None:
+        """Advance the bars. `level` (~0..1) is the real audio loudness when
+        available; the bars then pump with it, each still shimmying on its own
+        so it stays alive. `None` (or 0) falls back to the faked wobble."""
         self._t += 1
+        real = level is not None and level > 0.02 and self.energy > 0.05
         for i in range(self.n):
-            if self.energy > 0.05:
+            if real:
+                # cheap per-bar phase hash so bars don't move in lockstep,
+                # then ride the real level: a broad hump across the bars plus
+                # a fast wiggle, scaled by loudness.
+                wob = (math.sin(self._t * 0.9 + i * 1.7) + 1) / 2
+                shape = 0.55 + 0.45 * math.sin(i / max(1, self.n - 1) * math.pi)
+                self.targets[i] = max(0.0, min(1.0, level * shape * (0.6 + 0.5 * wob)))
+            elif self.energy > 0.05:
                 if abs(self.heights[i] - self.targets[i]) < 0.08:
                     # deterministic-ish wobble: cheap hash of bar + time
                     r = math.sin(self._t * 12.9898 + i * 78.233) * 43758.5453
