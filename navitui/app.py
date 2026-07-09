@@ -868,8 +868,11 @@ class NaviTuiApp(KitApp):
         elif oid == "shuffle-all":
             self._shuffle_everything()
         elif self._songs:
-            # enter on a view or playlist just plays it from the top
-            self._play_songs(self._songs, 0)
+            # enter on a view or playlist plays it from the top — but with
+            # shuffle on, start somewhere random so it actually feels shuffled
+            # (set_songs then keeps that pick first and randomises the rest)
+            start = random.randrange(len(self._songs)) if self.queue.shuffle else 0
+            self._play_songs(self._songs, start)
 
     # ── loading songs into the tracks pane ────────────────────────────
     def _tracks_title(self, view_id: str) -> str:
