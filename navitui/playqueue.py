@@ -72,6 +72,19 @@ class PlayQueue:
             self.index = min(self.index, len(self.songs) - 1)
         return song
 
+    def move(self, i: int, delta: int) -> int | None:
+        """Swap song i with its neighbour; returns the new position. The
+        current track can be moved too — `index` follows it."""
+        j = i + delta
+        if not (0 <= i < len(self.songs) and 0 <= j < len(self.songs)):
+            return None
+        self.songs[i], self.songs[j] = self.songs[j], self.songs[i]
+        if self.index == i:
+            self.index = j
+        elif self.index == j:
+            self.index = i
+        return j
+
     def clear(self) -> None:
         self.songs = []
         self._original = []

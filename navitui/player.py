@@ -44,6 +44,8 @@ class Player:
         on_position: Callable[[float, float], None],
         on_track_end: Callable[[bool], None],
         ao: str | None = None,
+        replaygain: str = "album",
+        gapless: str = "weak",
     ) -> None:
         self._on_position = on_position
         self._on_track_end = on_track_end
@@ -59,6 +61,10 @@ class Player:
             idle=True,
             audio_client_name="navitui",
         )
+        if replaygain in ("album", "track"):
+            opts["replaygain"] = replaygain
+        if gapless in ("yes", "weak", "no"):
+            opts["gapless_audio"] = gapless
         if ao:
             opts["ao"] = ao
         self._m = _mpv.MPV(**opts)
@@ -213,7 +219,7 @@ class NullPlayer:
         pass
 
 
-def create_player(on_position, on_track_end, ao: str | None = None):
+def create_player(on_position, on_track_end, ao: str | None = None, **opts):
     if not MPV_AVAILABLE:
         return NullPlayer()
-    return Player(on_position, on_track_end, ao=ao)
+    return Player(on_position, on_track_end, ao=ao, **opts)

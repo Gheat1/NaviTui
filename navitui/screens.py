@@ -204,6 +204,48 @@ class InputModal(ModalScreen):
         self.dismiss(None)
 
 
+class LyricsModal(ModalScreen):
+    """Scrollable lyrics for the current track."""
+
+    BINDINGS = [
+        Binding("escape", "close_modal", show=False),
+        Binding("q", "close_modal", show=False),
+        Binding("L", "close_modal", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    LyricsModal { align: center middle; background: $kit-overlay; }
+    LyricsModal #lyrics-box {
+        width: 64; height: auto; max-height: 85%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    LyricsModal Static { background: $kit-modal-bg; }
+    LyricsModal #lyrics-body { height: auto; max-height: 32; scrollbar-size-vertical: 1; }
+    LyricsModal #lyrics-text { height: auto; }
+    """
+
+    def __init__(self, title: str, lyrics: str) -> None:
+        super().__init__()
+        self._title = title
+        self._lyrics = lyrics
+
+    def compose(self) -> ComposeResult:
+        from ricekit.widgets import KitScroll
+
+        with Vertical(id="lyrics-box"):
+            yield Static(Text(self._title, style=f"bold {palette.sub}"))
+            with KitScroll(id="lyrics-body"):
+                yield Static(Text(f"\n{self._lyrics}\n", style=palette.text), id="lyrics-text")
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#lyrics-box"))
+        settle_pop_in(self, "#lyrics-box")
+        self.query_one("#lyrics-body").focus()
+
+    def action_close_modal(self) -> None:
+        self.dismiss(None)
+
+
 class SearchModal(ModalScreen):
     """Global search over artists, albums and songs — debounced, grouped.
 

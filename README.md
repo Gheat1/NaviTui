@@ -36,8 +36,15 @@ via [ricekit](https://github.com/Gheat1/ricekit) — and everything moves.
   repaints a handful of cells
 - **cache-first** — every pane renders instantly from disk, then refreshes
   silently in the background (auto-refresh every 3 minutes)
-- **scrobbles & stars** — now-playing + submission scrobbles at 50%, star and
-  unstar songs/albums/artists with `f`
+- **scrobbles, stars & ratings** — now-playing + submission scrobbles at
+  50%, star with `f`, rate 1-5 with the number row (same digit clears)
+- **part of your desktop** — media keys & waybar/playerctl via MPRIS2,
+  desktop notifications on track change (with the cover as the icon),
+  optional Discord rich presence
+- **track extras** — lyrics (`L`), copy a public share link (`S`), jump to
+  the track's album (`e`) or artist (`E`), reorder the queue (`ctrl+↑/↓`)
+- **yours to tune** — `~/.config/navitui/player.toml` (written with comments
+  on first run): remap every key, ReplayGain album/track, gapless mode
 - **full mouse support** — click anything, drag the panel dividers, click the
   progress bar to seek, click the volume gauge, click shuffle/repeat
 - **five themes**, live-previewed (`t` cycles, `T` picks) — including `clear`
@@ -66,9 +73,12 @@ brew install mpv
 then
 
 ```sh
-uv tool install git+https://github.com/Gheat1/NaviTui
+uv tool install "navitui[integrations] @ git+https://github.com/Gheat1/NaviTui"
 navitui
 ```
+
+(`[integrations]` pulls the optional MPRIS/Discord bits — drop it for the
+bare player.)
 
 First run asks for your server, username and password; the password is never
 stored — only the salted token (chmod 600). Works with Navidrome and any
@@ -100,4 +110,6 @@ Subsonic-compatible server. Try it against the public demo:
 
 ## license
 
-[MIT](LICENSE) — made by [@Gheat1](https://github.com/Gheat1)
+[GPL-3.0-or-later](LICENSE) — made by [@Gheat1](https://github.com/Gheat1).
+Releases up to 0.3.0 were MIT; from 0.4.0 NaviTui is GPL so forks stay
+open and keep their notices.

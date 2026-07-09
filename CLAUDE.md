@@ -44,7 +44,10 @@ navitui/playqueue.py  queue/shuffle/repeat logic (no UI in here)
 navitui/anim.py       animation primitives: shimmer, smooth_bar, marquee, viz
 navitui/widgets.py    Logo, Visualizer, NowPlaying (the animated transport)
 navitui/art.py        CoverArt widget, protocol picking, NAVITUI_ART override
-navitui/screens.py    onboarding, search modal, InputModal (playlist names)
+navitui/screens.py    onboarding, search modal, InputModal, LyricsModal
+navitui/config.py     player.toml: keybinds, replaygain, gapless, integrations
+navitui/mpris.py      MPRIS2 via dbus-fast (asyncio-native, two-way controls)
+navitui/integrations.py  desktop notifications + optional discord presence
 navitui/models.py     dataclasses that round-trip through the JSON cache
 tools/screenshots.py  headless SVG screenshot generator + FakeClient
 tools/demo.py         poses the real app in a real terminal (states: main/playlist/search/void)

@@ -226,6 +226,15 @@ class FakeClient:
     async def add_to_playlist(self, playlist_id, song_ids):
         pass
 
+    async def set_rating(self, song_id, rating):
+        pass
+
+    async def get_lyrics(self, artist, title):
+        return "La la la\nDemo lyrics, verse two\nLa la la"
+
+    async def create_share(self, item_id):
+        return f"https://demo.music.example/share/{item_id}"
+
     def stream_url(self, song_id):
         return str(self._tone)
 
@@ -245,11 +254,9 @@ async def shoot_main() -> None:
 
     app = NaviTuiApp(client=FakeClient(), ao="null")
     async with app.run_test(size=(132, 38)) as pilot:
-        await pilot.pause(0.8)
-        app.query_one("#pane1-list").focus()
-        await pilot.pause(0.6)
-        await pilot.press("l", "l")
-        await pilot.pause(0.6)
+        await pilot.pause(1.2)                 # sidebar + all-tracks settle
+        app.query_one("#tracks-list").focus()
+        await pilot.pause(0.3)
         await pilot.press("j", "j", "enter")   # play track 3
         await pilot.pause(2.5)
         await pilot.press("a")                 # queue one more

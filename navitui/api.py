@@ -190,6 +190,23 @@ class SubsonicClient:
         key = {"song": "id", "album": "albumId", "artist": "artistId"}[kind]
         await self._get("star" if star else "unstar", **{key: item_id})
 
+    async def set_rating(self, song_id: str, rating: int) -> None:
+        """rating 1-5, or 0 to clear."""
+        await self._get("setRating", id=song_id, rating=max(0, min(5, rating)))
+
+    async def get_lyrics(self, artist: str, title: str) -> str:
+        body = await self._get("getLyrics", artist=artist, title=title)
+        return body.get("lyrics", {}).get("value", "") or ""
+
+    async def create_share(self, item_id: str) -> str:
+        """Public share link for a song/album (needs sharing enabled
+        server-side). Returns the URL."""
+        body = await self._get("createShare", id=item_id)
+        shares = body.get("shares", {}).get("share", [])
+        if not shares or not shares[0].get("url"):
+            raise SubsonicError("server did not return a share url")
+        return shares[0]["url"]
+
     # ── cover art ─────────────────────────────────────────────────────
     # 1200px: big enough that kitty/sixel terminals get a crisp image at
     # any panel size; halfcell terminals are bounded by cells either way

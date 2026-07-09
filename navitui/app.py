@@ -27,13 +27,24 @@ from ricekit.modals import HelpModal, PickerModal
 from ricekit.storage import AppDirs
 from ricekit.widgets import NavList, Splitter
 
-from navitui import anim, player as playermod
+from navitui import anim, config as configmod, player as playermod
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
+from navitui.integrations import DiscordPresence, Notifier
 from navitui.models import Album, Artist, Playlist, Song
+from navitui.mpris import Mpris
 from navitui.playqueue import PlayQueue
-from navitui.screens import InputModal, OnboardingScreen, SearchModal
+from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal
 from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
+
+# read once at import so the bindings table below can be built from it;
+# remapping a key is an edit to player.toml + restart
+CONFIG = configmod.load(AppDirs("navitui").config_file.parent)
+
+
+def _kb(action_id: str, action: str, description: str = "", show: bool = False) -> Binding:
+    return Binding(CONFIG["keybinds"][action_id], action, description, show=show)
+
 
 VIEWS = [
     ("all-songs", "all tracks"),
@@ -65,8 +76,18 @@ HELP_SECTIONS = [
             ("a", "add track to queue"),
             ("A", "play track next"),
             ("x", "remove track (in queue panel)"),
+            ("ctrl+↑ / ctrl+↓", "move track up / down"),
             ("X", "clear queue"),
             ("", "played tracks dim out — scroll up for history"),
+        ],
+    ),
+    (
+        "config & desktop",
+        [
+            ("N", "toggle desktop notifications"),
+            ("", "media keys work via MPRIS (linux)"),
+            ("", "~/.config/navitui/player.toml: keybinds,"),
+            ("", "replaygain, gapless, discord presence"),
         ],
     ),
     (
@@ -77,6 +98,10 @@ HELP_SECTIONS = [
             ("/", "search  (enter play · a queue · A play next)"),
             ("p", "add track to a playlist"),
             ("f", "star / unstar track"),
+            ("1-5", "rate track (same digit again clears)"),
+            ("e / E", "go to track's album / artist"),
+            ("L", "lyrics"),
+            ("S", "copy share link"),
             ("R", "refresh from server"),
         ],
     ),
@@ -96,32 +121,41 @@ class NaviTuiApp(KitApp):
     TITLE = "NaviTui"
 
     BINDINGS = [
-        Binding("space", "play_pause", "play/pause"),
-        Binding("n", "next_track", "next"),
-        Binding("b", "prev_track", show=False),
-        Binding("slash", "search", "search"),
-        Binding("s", "toggle_shuffle", "shuffle"),
-        Binding("r", "cycle_repeat", "repeat"),
-        Binding("left", "seek(-5)", show=False),
-        Binding("right", "seek(5)", show=False),
-        Binding("shift+left", "seek(-30)", show=False),
-        Binding("shift+right", "seek(30)", show=False),
-        Binding("minus", "volume(-5)", show=False),
-        Binding("plus,equals_sign", "volume(5)", show=False),
-        Binding("m", "mute", show=False),
-        Binding("a", "enqueue(False)", show=False),
-        Binding("A", "enqueue(True)", show=False),
-        Binding("x", "queue_remove", show=False),
-        Binding("X", "queue_clear", show=False),
-        Binding("f", "star", show=False),
-        Binding("p", "playlist_add", show=False),
-        Binding("h", "focus_panel(-1)", show=False),
-        Binding("l", "focus_panel(1)", show=False),
-        Binding("R", "refresh", show=False),
-        Binding("t", "cycle_kit_theme", "theme"),
-        Binding("T", "change_theme", show=False),
-        Binding("question_mark", "help", "help"),
-        Binding("q", "quit", "quit"),
+        _kb("play_pause", "play_pause", "play/pause", show=True),
+        _kb("next_track", "next_track", "next", show=True),
+        _kb("prev_track", "prev_track"),
+        _kb("search", "search", "search", show=True),
+        _kb("shuffle", "toggle_shuffle", "shuffle", show=True),
+        _kb("repeat", "cycle_repeat", "repeat", show=True),
+        _kb("seek_back", "seek(-5)"),
+        _kb("seek_forward", "seek(5)"),
+        _kb("seek_back_big", "seek(-30)"),
+        _kb("seek_forward_big", "seek(30)"),
+        _kb("volume_down", "volume(-5)"),
+        _kb("volume_up", "volume(5)"),
+        _kb("mute", "mute"),
+        _kb("enqueue", "enqueue(False)"),
+        _kb("play_next", "enqueue(True)"),
+        _kb("queue_remove", "queue_remove"),
+        _kb("queue_clear", "queue_clear"),
+        _kb("queue_move_up", "queue_move(-1)"),
+        _kb("queue_move_down", "queue_move(1)"),
+        _kb("star", "star"),
+        _kb("playlist_add", "playlist_add"),
+        _kb("lyrics", "lyrics"),
+        _kb("share", "share"),
+        _kb("go_album", "go_album"),
+        _kb("go_artist", "go_artist"),
+        _kb("notifications", "toggle_notifications"),
+        _kb("panel_prev", "focus_panel(-1)"),
+        _kb("panel_next", "focus_panel(1)"),
+        _kb("refresh", "refresh"),
+        _kb("theme_cycle", "cycle_kit_theme", "theme", show=True),
+        _kb("theme_pick", "change_theme"),
+        _kb("help", "help", "help", show=True),
+        _kb("quit", "quit", "quit", show=True),
+        # rating is fixed on the number row (press again to clear)
+        *(Binding(str(n), f"rate({n})", show=False) for n in range(1, 6)),
     ]
 
     CSS = """
@@ -198,7 +232,20 @@ class NaviTuiApp(KitApp):
         if saved_view in VIEW_LABELS or saved_view.startswith("pl:"):
             self.view = saved_view
 
-        self.player = playermod.create_player(self._mpv_position, self._mpv_track_end, ao=self._ao)
+        configmod.write_template(self.dirs.config_file.parent)
+        self.notifier = Notifier(bool(CONFIG["notifications"]))
+        self.discord = DiscordPresence(
+            bool(CONFIG["discord_rich_presence"]), str(CONFIG["discord_app_id"])
+        )
+        self.mpris = Mpris()
+
+        self.player = playermod.create_player(
+            self._mpv_position,
+            self._mpv_track_end,
+            ao=self._ao,
+            replaygain=str(CONFIG["replaygain"]),
+            gapless=str(CONFIG["gapless"]),
+        )
         self.player.set_volume(int(state.get("volume", 80)))
         now = self.query_one("#now", NowPlaying)
         now.volume = self.player.volume
@@ -263,6 +310,48 @@ class NaviTuiApp(KitApp):
         sidebar.focus()
         self._highlight_view(self.view)
         self._load_playlists()
+        self.run_worker(self._start_mpris(), group="mpris")
+
+    async def _start_mpris(self) -> None:
+        # dbus-fast runs on our own event loop, so media-key controls can
+        # call app actions directly — no thread marshalling
+        controls = {
+            "play_pause": self.action_play_pause,
+            "play": lambda: (self.player.set_paused(False) if self.player.active else self.action_play_pause()),
+            "pause": lambda: self.player.set_paused(True),
+            "stop": self._external_stop,
+            "next": self.action_next_track,
+            "prev": self.action_prev_track,
+            "seek": self.player.seek,
+            "set_position": lambda s: self.player.seek_to(s / max(1.0, self.player.duration)),
+        }
+        if await self.mpris.start(controls):
+            self._announce()
+
+    def _external_stop(self) -> None:
+        self.player.stop()
+        now = self.query_one("#now", NowPlaying)
+        now.set_playing(False)
+        self._announce()
+
+    def _announce(self, track_change: bool = False) -> None:
+        """Fan the player state out to MPRIS, Discord and (on track change)
+        a desktop notification."""
+        active = bool(self.player and self.player.active)
+        song = self.queue.current if active else None
+        playing = active and not self.player.paused
+        art = None
+        if song is not None and song.cover_art and self.client is not None:
+            art = self.client.cached_art(song.cover_art)
+        self.mpris.update(
+            song, playing,
+            self.player.position if self.player else 0.0,
+            self.player.volume if self.player else 100,
+            str(art) if art else None,
+        )
+        self.discord.track(song, playing)
+        if track_change and song is not None:
+            self.notifier.track(song, art)
 
     def _render_status(self) -> None:
         if self.client is None:
@@ -464,6 +553,8 @@ class NaviTuiApp(KitApp):
         row.append(s.title, style=f"bold {palette.blue}" if is_current else palette.text)
         if s.starred:
             row.append(f" {icons.STAR}", style=palette.yellow)
+        if s.user_rating:
+            row.append(f" {chr(0x2460 + s.user_rating - 1)}", style=palette.peach)  # ①-⑤
         row.append(f"  {s.artist}", style=palette.dim)
         row.append(f" · {anim.fmt_time(s.duration)}", style=palette.vfaint)
         return Option(row, id=s.id)
@@ -538,6 +629,7 @@ class NaviTuiApp(KitApp):
         self._render_queue()
         self._refresh_song_markers()
         self._persist_queue()
+        self._announce(track_change=True)
 
     def _refresh_song_markers(self) -> None:
         """Re-render the tracks pane so the ♪ marker follows the player."""
@@ -546,6 +638,7 @@ class NaviTuiApp(KitApp):
     def action_play_pause(self) -> None:
         if self.player.active:
             self.player.toggle_pause()
+            self._announce()
         elif self.queue.current is not None:
             # resume a restored queue exactly where it left off
             self._play_current(resume_at=self._resume_position)
@@ -576,6 +669,7 @@ class NaviTuiApp(KitApp):
         now.volume = volume
         now.flash_volume()
         self.dirs.save_state({"volume": volume})
+        self._announce()
 
     def set_volume_fraction(self, fraction: float) -> None:
         self.action_volume(round(fraction * 100) - self.player.volume)
@@ -620,6 +714,7 @@ class NaviTuiApp(KitApp):
             return
         now = self.query_one("#now", NowPlaying)
         now.set_progress(position, duration)
+        self.mpris.set_position(position)
         if position > 3:
             self._end_failures = 0
         song = self.queue.current
@@ -657,6 +752,7 @@ class NaviTuiApp(KitApp):
             now.set_playing(False)
             now.set_progress(0.0, 0.0)
             self._render_queue()
+            self._announce()
 
     # ── queue ─────────────────────────────────────────────────────────
     def _render_queue(self) -> None:
@@ -819,6 +915,118 @@ class NaviTuiApp(KitApp):
             pass
         self._load_playlists()
 
+    # ── track extras: rating, lyrics, share, go-to ────────────────────
+    def _target_song(self) -> Song | None:
+        """The song an action applies to: the highlighted one if a list is
+        focused, else whatever is playing."""
+        return self._highlighted_song() or self.queue.current
+
+    def action_rate(self, rating: int) -> None:
+        song = self._target_song()
+        if song is None:
+            return
+        new = 0 if song.user_rating == rating else rating  # same digit clears
+        song.user_rating = new
+        self._rate(song.id, new)
+        self._refresh_song_markers()
+        self.notify(f"rating: {'—' if new == 0 else '★' * new}", timeout=1.5)
+
+    @work(group="mutate")
+    async def _rate(self, song_id: str, rating: int) -> None:
+        self._mutations += 1
+        try:
+            await self.client.set_rating(song_id, rating)
+        except Exception as e:
+            self.notify(f"couldn't set rating: {e}", severity="warning")
+        finally:
+            self._mutations -= 1
+
+    def action_lyrics(self) -> None:
+        song = self._target_song()
+        if song is None:
+            self.notify("nothing to look up", timeout=2)
+            return
+        self._fetch_lyrics(song)
+
+    @work(exclusive=True, group="lyrics")
+    async def _fetch_lyrics(self, song: Song) -> None:
+        try:
+            text = await self.client.get_lyrics(song.artist, song.title)
+        except Exception:
+            text = ""
+        if not text.strip():
+            self.notify(f"no lyrics found for {song.title}", timeout=3)
+            return
+        self.push_screen(LyricsModal(f"{song.title} — {song.artist}", text))
+
+    def action_share(self) -> None:
+        song = self._target_song()
+        if song is None:
+            return
+        self._share(song)
+
+    @work(group="mutate")
+    async def _share(self, song: Song) -> None:
+        try:
+            url = await self.client.create_share(song.id)
+        except Exception as e:
+            self.notify(f"couldn't create share: {e}", severity="warning", timeout=5)
+            return
+        self.copy_to_clipboard(url)
+        self.notify(f"share link copied · {url}", timeout=5)
+
+    def action_go_album(self) -> None:
+        song = self._target_song()
+        if song is None or not song.album_id:
+            return
+        self._load_album_adhoc(song)
+
+    @work(exclusive=True, group="songs")
+    async def _load_album_adhoc(self, song: Song) -> None:
+        title = f"album · {song.album}"
+        self.view = f"album:{song.album_id}"
+        self._highlight_view(None)
+        cache_key = f"album-songs-{song.album_id}"
+        cached = self.dirs.read_cache(cache_key)
+        if cached:
+            self._show_songs([Song.from_dict(s) for s in cached.get("songs", [])], title)
+        try:
+            songs = await self.client.get_album_songs(song.album_id)
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        self.dirs.write_cache(cache_key, {"songs": [s.to_dict() for s in songs]})
+        self._show_songs(songs, title)
+        ol = self.query_one("#tracks-list", ClickList)
+        idx = next((i for i, s in enumerate(songs) if s.id == song.id), None)
+        if idx is not None:
+            ol.highlighted = idx
+        ol.focus()
+
+    def action_go_artist(self) -> None:
+        song = self._target_song()
+        if song is None or not song.artist_id:
+            return
+        self._load_artist_songs(Artist(id=song.artist_id, name=song.artist))
+
+    def action_toggle_notifications(self) -> None:
+        on_now = self.notifier.toggle()
+        self.notify(f"notifications {'on' if on_now else 'off'}", timeout=2)
+
+    def action_queue_move(self, delta: int) -> None:
+        focused = self.focused
+        if focused is None or focused.id != "queue-list":
+            return
+        ol = self.query_one("#queue-list", NavList)
+        if ol.highlighted is None:
+            return
+        new = self.queue.move(ol.highlighted, delta)
+        if new is None:
+            return
+        self._render_queue()
+        ol.highlighted = new
+        self._persist_queue()
+
     # ── starring ──────────────────────────────────────────────────────
     def action_star(self) -> None:
         song = self._highlighted_song()
@@ -917,10 +1125,8 @@ class NaviTuiApp(KitApp):
 
     def action_refresh(self) -> None:
         self._load_playlists()
-        if self.view.startswith("artist:"):
-            pass  # ad-hoc view; nothing to re-trigger
-        else:
-            self._load_view(self.view)
+        if not self.view.startswith(("artist:", "album:")):
+            self._load_view(self.view)  # ad-hoc views have no sidebar entry
         self.notify("refreshing", timeout=1.5)
 
     def _maybe_auto_refresh(self) -> None:
@@ -929,7 +1135,7 @@ class NaviTuiApp(KitApp):
         if self.screen is not self.screen_stack[0]:
             return  # modal open — don't yank state around underneath it
         self._load_playlists()
-        if not self.view.startswith("artist:"):
+        if not self.view.startswith(("artist:", "album:")):
             self._load_view(self.view)
 
     def action_help(self) -> None:
@@ -959,6 +1165,8 @@ class NaviTuiApp(KitApp):
             self.notify("offline — showing cached library", severity="warning", timeout=4)
 
     async def action_quit(self) -> None:
+        self.mpris.stop()
+        self.discord.stop()
         if self.player is not None:
             self._persist_queue()
             self.player.terminate()

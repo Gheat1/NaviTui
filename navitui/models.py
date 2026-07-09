@@ -86,6 +86,7 @@ class Song:
     suffix: str = ""
     bit_rate: int | None = None
     starred: bool = False
+    user_rating: int = 0
 
     @classmethod
     def from_api(cls, d: dict) -> "Song":
@@ -104,6 +105,7 @@ class Song:
             suffix=d.get("suffix", ""),
             bit_rate=d.get("bitRate"),
             starred=bool(d.get("starred")),
+            user_rating=int(d.get("userRating", 0) or 0),
         )
 
     def to_dict(self) -> dict:
