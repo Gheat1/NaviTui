@@ -12,6 +12,7 @@ just tells you how to get sound on your OS.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Callable
 
 MPV_AVAILABLE = True
@@ -201,6 +202,39 @@ class Player:
         self._m.volume = value
         return value
 
+    async def fade_out(self, seconds: float) -> None:
+        """Soft volume ramp to silence over `seconds`, then leave mpv muted-by-
+        volume. A single mpv instance can't truly crossfade two streams, so this
+        is the audible half of a soft transition; the caller loads the next
+        track and calls `fade_in` to restore. Runs on the app's event loop (not
+        mpv's thread), so awaiting between steps never blocks playback. Restores
+        nothing on its own — `fade_in(base)` puts the user's volume back."""
+        base = self.volume
+        if seconds <= 0 or base <= 0:
+            return
+        steps = max(1, int(seconds / 0.05))
+        for i in range(steps):
+            try:
+                self._m.volume = base * (1 - (i + 1) / steps)
+            except Exception:
+                return
+            await asyncio.sleep(seconds / steps)
+
+    async def fade_in(self, base: int, seconds: float) -> None:
+        """Ramp volume from silence up to `base` (the user's set volume) over
+        `seconds`, restoring it exactly at the end. Pairs with `fade_out`."""
+        if seconds <= 0 or base <= 0:
+            self.set_volume(base)
+            return
+        steps = max(1, int(seconds / 0.05))
+        for i in range(steps):
+            try:
+                self._m.volume = base * (i + 1) / steps
+            except Exception:
+                break
+            await asyncio.sleep(seconds / steps)
+        self.set_volume(base)  # land on the exact user volume
+
     @property
     def muted(self) -> bool:
         return bool(self._m.mute)
@@ -266,6 +300,12 @@ class NullPlayer:
 
     def set_volume(self, value: int) -> int:
         return value
+
+    async def fade_out(self, seconds: float) -> None:
+        pass
+
+    async def fade_in(self, base: int, seconds: float) -> None:
+        pass
 
     def toggle_mute(self) -> bool:
         return False

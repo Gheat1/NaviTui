@@ -323,6 +323,9 @@ class NaviTuiApp(KitApp):
         self._dl_total = 0
         self._dl_done = 0
         self._dl_failed = 0
+        self._crossfade = max(0.0, float(CONFIG["crossfade"]))  # soft-fade seconds
+        self._fade_base: int | None = None  # user volume captured across an active fade
+        self._prefetched: str | None = None  # song id we last warmed, to dedup
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self):
@@ -880,8 +883,7 @@ class NaviTuiApp(KitApp):
     @on(OptionList.OptionSelected, "#queue-list")
     def _queue_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.highlighted is not None:
-            self.queue.jump(event.option_list.highlighted)
-            self._play_current()
+            self._change_track(lambda i=event.option_list.highlighted: self.queue.jump(i))
 
     # ── type-to-filter (an explicit mode over the tracks pane) ─────────
     # The app binds many bare single letters to global actions, so we never
@@ -1060,8 +1062,7 @@ class NaviTuiApp(KitApp):
         self.notify(f"shuffling all {len(self._songs)} tracks", timeout=3)
 
     def _play_songs(self, songs: list[Song], start: int) -> None:
-        self.queue.set_songs(songs, start)
-        self._play_current()
+        self._change_track(lambda: self.queue.set_songs(songs, start))
 
     def _stream_source(self, song: Song) -> str | None:
         """Where to play `song` from: a pinned local file if we have one,
@@ -1116,6 +1117,39 @@ class NaviTuiApp(KitApp):
         self._refresh_song_markers()
         self._persist_queue()
         self._announce(track_change=True)
+        self._prefetch_next()
+
+    def _prefetch_next(self) -> None:
+        """Warm the next queued track's stream so its start is instant (and
+        gapless is hardened). Peeks the queue without mutating it, dedups on the
+        song id we last warmed, and skips anything already pinned or a case
+        where prefetch can't help (offline mode, no client, no next track,
+        repeat-one)."""
+        if self.client is None or self._offline:
+            return
+        nxt = self.queue.peek_next()
+        # peek_next returns `current` under repeat-one — nothing to warm there
+        if nxt is None or (self.queue.current is not None and nxt.id == self.queue.current.id):
+            return
+        if nxt.id == self._prefetched or self.client.cached_stream(nxt.id):
+            return
+        self._prefetched = nxt.id
+        self._warm_next(nxt)
+
+    @work(exclusive=True, group="prefetch")
+    async def _warm_next(self, song: Song) -> None:
+        """Pin the next track to the audio cache off the UI thread. Reuses the
+        offline-download path so a prefetched track is also available offline;
+        stays silent (no notify) and swallows failures — it's pure speculation,
+        and a miss just means the normal stream URL is used when it plays."""
+        try:
+            await self.client.download_song(song.id)
+        except Exception:
+            self._prefetched = None  # let a retry happen next time round
+            return
+        # the ✓ marker can now show for the freshly-pinned track
+        if self.is_running:
+            self._refresh_song_markers()
 
     def _refresh_song_markers(self) -> None:
         """Re-render the tracks pane so the ♪ marker (and stars, ✓, ratings)
@@ -1131,18 +1165,45 @@ class NaviTuiApp(KitApp):
             self._play_current(resume_at=self._resume_position)
             self._resume_position = 0.0
 
-    def action_next_track(self) -> None:
-        song = self.queue.advance(natural=False)
+    def _change_track(self, pick) -> None:
+        """Manual track change (skip/prev/jump): `pick()` moves the queue and
+        returns the new song. With crossfade on and audio already playing, do a
+        short fade-out first, then load + fade-in; otherwise switch instantly.
+        Natural EOF doesn't come through here — gapless owns that seam."""
+        if self._crossfade > 0 and self.player.active:
+            # a rapid re-skip cancels the in-flight fade mid-ramp, so the live
+            # volume may be lowered; capture the *true* user volume once (here,
+            # synchronously) and keep it in _fade_base so successive skips don't
+            # ratchet it down. Cleared only when a fade lands cleanly.
+            if self._fade_base is None:
+                self._fade_base = self.player.volume
+            self._crossfade_change(pick, self._fade_base)
+            return
+        song = pick()
         if song is not None:
             self._play_current()
+
+    @work(exclusive=True, group="crossfade")
+    async def _crossfade_change(self, pick, base: int) -> None:
+        half = self._crossfade / 2
+        await self.player.fade_out(half)
+        song = pick()
+        if song is None:
+            self.player.set_volume(base)  # nothing to play — undo the fade
+            self._fade_base = None
+            return
+        self._play_current()  # loads + starts the next track at low volume
+        await self.player.fade_in(base, half)
+        self._fade_base = None  # landed cleanly; a cancel skips this line
+
+    def action_next_track(self) -> None:
+        self._change_track(lambda: self.queue.advance(natural=False))
 
     def action_prev_track(self) -> None:
         if self.player.position > 4:
             self.player.seek_to(0.0)
             return
-        song = self.queue.prev()
-        if song is not None:
-            self._play_current()
+        self._change_track(self.queue.prev)
 
     def action_seek(self, seconds: int) -> None:
         self.player.seek(seconds)

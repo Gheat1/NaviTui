@@ -75,6 +75,7 @@ DEFAULTS = {
     "gapless": "weak",            # yes | weak | no
     "max_bitrate": 0,             # streaming cap in kbps (0 = original/unlimited)
     "stream_format": "",          # transcode target: raw | mp3 | opus | "" original
+    "crossfade": 0.0,             # seconds of soft volume fade on track change (0 = off)
     "notifications": True,        # desktop notification on track change
     "art_theming": True,          # tint the chrome with the cover's color
     "discord_rich_presence": False,
@@ -100,6 +101,13 @@ _TEMPLATE = """\
 # Cycle presets at runtime with the quality keybind (see [keybinds] below).
 #max_bitrate = 0
 #stream_format = ""
+
+# Crossfade: seconds of soft volume fade-out/fade-in around a track change
+# (0 = off, the default). Your set volume is restored exactly afterwards.
+# The next queued track is always pre-fetched regardless of this setting so
+# starts stay instant — this knob only controls the audible fade.
+#crossfade = 0.0
+
 
 # Desktop notification on track change (toggle at runtime with N)
 #notifications = true
@@ -150,6 +158,8 @@ def load(config_dir: Path) -> dict:
             for action, keys in value.items():
                 if action in KEYBINDS and isinstance(keys, str) and keys:
                     cfg["keybinds"][action] = keys
+        elif key in DEFAULTS and isinstance(DEFAULTS[key], float) and isinstance(value, (int, float)):
+            cfg[key] = float(value)  # accept bare ints for float knobs (crossfade = 2)
         elif key in DEFAULTS and isinstance(value, type(DEFAULTS[key])):
             cfg[key] = value
     return cfg

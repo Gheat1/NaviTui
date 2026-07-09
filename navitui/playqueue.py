@@ -106,6 +106,20 @@ class PlayQueue:
             return self.current
         return None  # queue ran out
 
+    def peek_next(self) -> Song | None:
+        """The track a natural `advance()` would land on, without mutating
+        state. Used to pre-fetch what's up next. Repeat-one peeks the current
+        track (already playing, so prefetch is a no-op); repeat-all wraps."""
+        if not self.songs:
+            return None
+        if self.repeat is Repeat.ONE:
+            return self.current
+        if self.index + 1 < len(self.songs):
+            return self.songs[self.index + 1]
+        if self.repeat is not Repeat.OFF:
+            return self.songs[0]
+        return None
+
     def prev(self) -> Song | None:
         if not self.songs:
             return None
