@@ -20,7 +20,7 @@ from pathlib import Path
 
 import httpx
 
-from navitui.models import Album, Artist, Playlist, SearchResults, Song
+from navitui.models import Album, Artist, Bookmark, Genre, Playlist, SearchResults, Song
 
 API_VERSION = "1.16.1"
 CLIENT_NAME = "navitui"
@@ -152,6 +152,33 @@ class SubsonicClient:
             albums=[Album.from_api(a) for a in result.get("album", [])],
             songs=[Song.from_api(s) for s in result.get("song", [])],
         )
+
+    async def get_genres(self) -> list[Genre]:
+        """All genres in the library (`getGenres`), most-populated first so the
+        picker leads with the genres worth browsing."""
+        body = await self._get("getGenres")
+        genres = [Genre.from_api(g) for g in body.get("genres", {}).get("genre", [])]
+        genres.sort(key=lambda g: g.song_count, reverse=True)
+        return genres
+
+    async def get_songs_by_genre(self, genre: str, count: int = 500) -> list[Song]:
+        """Songs tagged with `genre` (`getSongsByGenre`)."""
+        body = await self._get("getSongsByGenre", genre=genre, count=count)
+        return [Song.from_api(s) for s in body.get("songsByGenre", {}).get("song", [])]
+
+    async def get_bookmarks(self) -> list[Bookmark]:
+        """Saved resume points across long tracks / audiobooks
+        (`getBookmarks`)."""
+        body = await self._get("getBookmarks")
+        return [Bookmark.from_api(b) for b in body.get("bookmarks", {}).get("bookmark", [])]
+
+    async def create_bookmark(self, song_id: str, position_ms: int, comment: str | None = None) -> None:
+        """Save/replace a resume point at `position_ms` for a song
+        (`createBookmark`)."""
+        await self._get("createBookmark", id=song_id, position=int(position_ms), comment=comment)
+
+    async def delete_bookmark(self, song_id: str) -> None:
+        await self._get("deleteBookmark", id=song_id)
 
     async def get_random_songs(self, size: int = 50) -> list[Song]:
         body = await self._get("getRandomSongs", size=size)

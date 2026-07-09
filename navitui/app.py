@@ -31,7 +31,7 @@ from navitui import anim, artcolor, card, config as configmod, player as playerm
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, Notifier
-from navitui.models import Album, Artist, Playlist, Song
+from navitui.models import Album, Artist, Bookmark, Genre, Playlist, Song
 from navitui.mpris import Mpris
 from navitui import mutations as mutations_mod
 from navitui.mutations import MutationQueue
@@ -43,6 +43,9 @@ from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
 # read once at import so the bindings table below can be built from it;
 # remapping a key is an edit to player.toml + restart
 CONFIG = configmod.load(AppDirs("navitui").config_file.parent)
+
+# nf-fa-bookmark — as a \uXXXX escape (raw PUA glyphs don't survive patching)
+BOOKMARK_GLYPH = "\uf02e"
 
 
 def _kb(action_id: str, action: str, description: str = "", show: bool = False) -> Binding:
@@ -109,6 +112,8 @@ HELP_SECTIONS = [
             ("O", "offline mode — play only downloaded tracks"),
             ("1-5", "rate track (same digit again clears)"),
             ("e / E", "go to track's album / artist"),
+            ("y", "browse by genre"),
+            ("w / W", "bookmark position / jump to a bookmark"),
             ("L", "lyrics"),
             ("S", "copy share link"),
             ("C", "export now-playing card (SVG)"),
@@ -165,6 +170,9 @@ class NaviTuiApp(KitApp):
         _kb("export_card", "export_card"),
         _kb("go_album", "go_album"),
         _kb("go_artist", "go_artist"),
+        _kb("genres", "pick_genre"),
+        _kb("bookmark", "bookmark"),
+        _kb("bookmarks", "pick_bookmark"),
         _kb("notifications", "toggle_notifications"),
         _kb("panel_prev", "focus_panel(-1)"),
         _kb("panel_next", "focus_panel(1)"),
@@ -1422,6 +1430,146 @@ class NaviTuiApp(KitApp):
             return
         self._load_artist_songs(Artist(id=song.artist_id, name=song.artist))
 
+    # ── genre browse ──────────────────────────────────────────────────
+    def action_pick_genre(self) -> None:
+        """Pick a genre to load its songs into the tracks pane (ad-hoc view)."""
+        if self.client is None:
+            return
+        cached = self.dirs.read_cache("genres")
+        genres = [Genre.from_dict(g) for g in cached.get("genres", [])] if cached else []
+        if genres:
+            self._show_genre_picker(genres)
+        self._fetch_genres(show=not genres)
+
+    @work(exclusive=True, group="genres")
+    async def _fetch_genres(self, show: bool) -> None:
+        try:
+            genres = await self.client.get_genres()
+        except Exception as e:
+            if show:
+                self._connection_trouble(e)
+            return
+        self.dirs.write_cache("genres", {"genres": [g.to_dict() for g in genres]})
+        if show:
+            self._show_genre_picker(genres)
+
+    def _show_genre_picker(self, genres: list[Genre]) -> None:
+        if not genres:
+            self.notify("no genres found", timeout=2)
+            return
+        options = [
+            Option(
+                Text.assemble(
+                    (f" {icons.TAG} ", palette.mauve),
+                    (g.name, palette.text),
+                    (f"  {g.song_count}♪", palette.vfaint),
+                ),
+                id=g.name,
+            )
+            for g in genres
+        ]
+        self.push_screen(PickerModal("browse by genre", options), self._genre_picked)
+
+    def _genre_picked(self, name: str | None) -> None:
+        if name:
+            self._load_genre_songs(name)
+
+    @work(exclusive=True, group="songs")
+    async def _load_genre_songs(self, genre: str) -> None:
+        """Ad-hoc view: every song tagged with `genre`. Cache-first, mirrors
+        the artist/album ad-hoc loaders."""
+        title = f"genre · {genre}"
+        self.view = f"genre:{genre}"
+        self._highlight_view(None)
+        cache_key = f"genre-{genre}"
+        cached = self.dirs.read_cache(cache_key)
+        if cached:
+            self._show_songs([Song.from_dict(s) for s in cached.get("songs", [])], title)
+        try:
+            songs = await self.client.get_songs_by_genre(genre)
+        except Exception as e:
+            self._connection_trouble(e)
+            return
+        self.dirs.write_cache(cache_key, {"songs": [s.to_dict() for s in songs]})
+        if self.view == f"genre:{genre}":
+            self._show_songs(songs, title)
+            self.query_one("#tracks-list", ClickList).focus()
+
+    # ── bookmarks (resume long tracks / audiobooks) ───────────────────
+    def action_bookmark(self) -> None:
+        """Save a resume point at the CURRENT playback position."""
+        song = self.queue.current
+        if song is None or self.player is None or not self.player.active:
+            self.notify("nothing playing to bookmark", timeout=2)
+            return
+        position_ms = int(max(0.0, self.player.position) * 1000)
+        self._create_bookmark(song, position_ms)
+
+    @work(group="mutate")
+    async def _create_bookmark(self, song: Song, position_ms: int) -> None:
+        try:
+            await self.client.create_bookmark(song.id, position_ms)
+        except Exception as e:
+            self.notify(f"couldn't bookmark: {e}", severity="warning", timeout=5)
+            return
+        try:
+            self.dirs.cache_dir.joinpath("bookmarks.json").unlink()
+        except OSError:
+            pass
+        self.notify(
+            f"bookmarked {song.title} at {anim.fmt_time(position_ms // 1000)}", timeout=3
+        )
+
+    def action_pick_bookmark(self) -> None:
+        """Pick a saved bookmark to resume: plays the song and seeks to it."""
+        if self.client is None:
+            return
+        cached = self.dirs.read_cache("bookmarks")
+        marks = [Bookmark.from_dict(b) for b in cached.get("bookmarks", [])] if cached else []
+        if marks:
+            self._show_bookmark_picker(marks)
+        self._fetch_bookmarks(show=not marks)
+
+    @work(exclusive=True, group="bookmarks")
+    async def _fetch_bookmarks(self, show: bool) -> None:
+        try:
+            marks = await self.client.get_bookmarks()
+        except Exception as e:
+            if show:
+                self._connection_trouble(e)
+            return
+        self.dirs.write_cache("bookmarks", {"bookmarks": [b.to_dict() for b in marks]})
+        if show:
+            self._show_bookmark_picker(marks)
+
+    def _show_bookmark_picker(self, marks: list[Bookmark]) -> None:
+        if not marks:
+            self.notify("no bookmarks yet — press w while playing", timeout=3)
+            return
+        options = []
+        for i, m in enumerate(marks):
+            row = Text.assemble(
+                (f" {BOOKMARK_GLYPH} ", palette.peach),
+                (m.song.title, palette.text),
+                (f"  {m.song.artist}", palette.dim),
+                (f"  @ {anim.fmt_time(m.position_ms // 1000)}", palette.vfaint),
+            )
+            options.append(Option(row, id=str(i)))
+        self._pending_bookmarks = marks
+        self.push_screen(PickerModal("resume a bookmark", options), self._bookmark_picked)
+
+    def _bookmark_picked(self, index: str | None) -> None:
+        if index is None:
+            return
+        marks = getattr(self, "_pending_bookmarks", [])
+        try:
+            mark = marks[int(index)]
+        except (ValueError, IndexError):
+            return
+        # play the bookmarked song solo, seeking straight to the saved point
+        self.queue.set_songs([mark.song], 0)
+        self._play_current(resume_at=mark.position_ms / 1000.0)
+
     def action_toggle_notifications(self) -> None:
         on_now = self.notifier.toggle()
         self.notify(f"notifications {'on' if on_now else 'off'}", timeout=2)
@@ -1669,7 +1817,7 @@ class NaviTuiApp(KitApp):
 
     def action_refresh(self) -> None:
         self._load_playlists()
-        if not self.view.startswith(("artist:", "album:")):
+        if not self.view.startswith(("artist:", "album:", "genre:")):
             self._load_view(self.view)  # ad-hoc views have no sidebar entry
         self.notify("refreshing", timeout=1.5)
 
@@ -1679,7 +1827,7 @@ class NaviTuiApp(KitApp):
         if self.screen is not self.screen_stack[0]:
             return  # modal open — don't yank state around underneath it
         self._load_playlists()
-        if not self.view.startswith(("artist:", "album:")):
+        if not self.view.startswith(("artist:", "album:", "genre:")):
             self._load_view(self.view)
         # if we're reachable enough to auto-refresh, try draining the queue too;
         # the flush worker no-ops when offline or empty and re-parks on failure

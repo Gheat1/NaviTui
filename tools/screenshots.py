@@ -201,6 +201,31 @@ class FakeClient:
             songs=[s for s in every_song if q in s.title.lower()],
         )
 
+    async def get_genres(self):
+        from navitui.models import Genre
+        every_song = [s for songs in self.songs.values() for s in songs]
+        return [
+            Genre(name="shoegaze", song_count=len(every_song) // 2, album_count=4),
+            Genre(name="post-rock", song_count=len(every_song) // 3, album_count=3),
+            Genre(name="ambient", song_count=len(every_song) // 5, album_count=2),
+        ]
+
+    async def get_songs_by_genre(self, genre, count=500):
+        return (self.songs["al0"] + self.songs["al1"])[:count]
+
+    async def get_bookmarks(self):
+        from navitui.models import Bookmark
+        return [
+            Bookmark(song=self.songs["al0"][0], position_ms=63000, comment="ch. 3"),
+            Bookmark(song=self.songs["al2"][1], position_ms=1200_000, comment=""),
+        ]
+
+    async def create_bookmark(self, song_id, position_ms, comment=None):
+        pass
+
+    async def delete_bookmark(self, song_id):
+        pass
+
     async def get_random_songs(self, size=50):
         return self.songs["al1"]
 
