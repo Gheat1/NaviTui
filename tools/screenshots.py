@@ -238,6 +238,13 @@ class FakeClient:
     def stream_url(self, song_id):
         return str(self._tone)
 
+    def cached_stream(self, song_id):
+        # pretend a couple of tracks are already pinned so the ✓ marker shows
+        return self._tone if song_id in ("s0-0", "s0-1") else None
+
+    async def download_song(self, song_id):
+        return self._tone
+
     def cached_art(self, cover_id, size=1200):
         return self._art_dir / f"{cover_id}-600"  # one size fits the fake
 
