@@ -45,7 +45,10 @@ class CoverArt(Vertical):
 
     DEFAULT_CSS = """
     CoverArt { align: center middle; }
-    CoverArt > .cover-image { width: 100%; height: 100%; }
+    /* auto/auto lets textual-image "contain" the cover: scaled to fit the
+       panel with its aspect ratio kept (100%/100% would stretch it to fill,
+       squishing non-square art), then centred by the align above. */
+    CoverArt > .cover-image { width: auto; height: auto; }
     CoverArt > #cover-placeholder {
         width: 100%; height: 100%;
         content-align: center middle;
