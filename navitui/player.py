@@ -260,7 +260,26 @@ class NullPlayer:
         pass
 
 
-def create_player(on_position, on_track_end, ao: str | None = None, **opts):
+def create_player(
+    on_position,
+    on_track_end,
+    ao: str | None = None,
+    jukebox: bool = False,
+    client=None,
+    loop=None,
+    on_unsupported=None,
+    **opts,
+):
+    """Pick the playback engine.
+
+    Default: the local libmpv `Player` (or `NullPlayer` if libmpv is missing).
+    With `jukebox=True` and a live client+loop, return a `JukeboxPlayer` that
+    drives the server's own audio out instead — same interface, no mpv. The
+    app can flip between the two at runtime (see NaviTuiApp._make_player)."""
+    if jukebox and client is not None and loop is not None:
+        from navitui.jukebox import JukeboxPlayer
+
+        return JukeboxPlayer(on_position, on_track_end, client, loop, on_unsupported)
     if not MPV_AVAILABLE:
         return NullPlayer()
     return Player(on_position, on_track_end, ao=ao, **opts)

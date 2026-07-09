@@ -90,6 +90,7 @@ HELP_SECTIONS = [
         "config & desktop",
         [
             ("N", "toggle desktop notifications"),
+            ("J", "jukebox mode — play on the server's audio out"),
             ("", "media keys work via MPRIS (linux)"),
             ("", "~/.config/navitui/player.toml: keybinds,"),
             ("", "replaygain, gapless, discord presence"),
@@ -159,6 +160,7 @@ class NaviTuiApp(KitApp):
         _kb("download_view", "download_view"),
         _kb("download_all", "download_all"),
         _kb("offline_toggle", "toggle_offline"),
+        _kb("jukebox_toggle", "toggle_jukebox"),
         _kb("playlist_add", "playlist_add"),
         _kb("lyrics", "lyrics"),
         _kb("share", "share"),
@@ -242,6 +244,7 @@ class NaviTuiApp(KitApp):
         self._queue_scrolled_to = -2
         self._zen = False
         self._offline = False  # play/browse only what's pinned; skip the network
+        self._jukebox = False  # play on the server's audio out, not this machine
         self._radio = False  # endless radio: refill the queue when it drains
         self._radio_filling = False  # guard against a runaway refill loop
         self._dl_total = 0
@@ -288,6 +291,8 @@ class NaviTuiApp(KitApp):
             self.view = saved_view
         self._offline = bool(state.get("offline", False))
         self._radio = bool(state.get("radio", False))
+        # jukebox mode: config default, overridable by the last runtime toggle
+        self._jukebox = bool(state.get("jukebox", CONFIG["jukebox"]))
 
         configmod.write_template(self.dirs.config_file.parent)
         self.notifier = Notifier(bool(CONFIG["notifications"]))
@@ -297,13 +302,9 @@ class NaviTuiApp(KitApp):
         self.mpris = Mpris()
         self.remote = Remote()
 
-        self.player = playermod.create_player(
-            self._mpv_position,
-            self._mpv_track_end,
-            ao=self._ao,
-            replaygain=str(CONFIG["replaygain"]),
-            gapless=str(CONFIG["gapless"]),
-        )
+        # start on the local engine; jukebox needs a client, so `_start` swaps
+        # to it once one exists (keeps mpv the safe default through onboarding)
+        self.player = self._make_player(jukebox=False)
         self.player.set_volume(int(state.get("volume", 80)))
         now = self.query_one("#now", NowPlaying)
         now.volume = self.player.volume
@@ -346,6 +347,77 @@ class NaviTuiApp(KitApp):
                 return
         self._start()
 
+    # ── engine selection (local mpv ⇄ server jukebox) ─────────────────
+    def _make_player(self, jukebox: bool):
+        """Build a player for the requested mode. Jukebox drives the server's
+        own audio out via the same duck-typed interface as the local mpv
+        player; if it can't be built (no client yet) we fall back to local so
+        mpv always stays the safe default."""
+        if jukebox and self.client is not None:
+            return playermod.create_player(
+                self._mpv_position,
+                self._mpv_track_end,
+                jukebox=True,
+                client=self.client,
+                loop=self._loop,
+                on_unsupported=self._jukebox_unsupported,
+            )
+        return playermod.create_player(
+            self._mpv_position,
+            self._mpv_track_end,
+            ao=self._ao,
+            replaygain=str(CONFIG["replaygain"]),
+            gapless=str(CONFIG["gapless"]),
+        )
+
+    def _switch_player(self, jukebox: bool, announce: bool = True) -> None:
+        """Tear down the current engine and stand up the other, preserving
+        volume and (re)starting the current track where it left off."""
+        old = self.player
+        volume = old.volume if old is not None else 80
+        position = old.position if old is not None else 0.0
+        was_active = bool(old is not None and old.active)
+        if old is not None:
+            old.terminate()
+        self.player = self._make_player(jukebox=jukebox)
+        self._jukebox = isinstance(self.player, self._jukebox_type())
+        self.player.set_volume(volume)
+        self.query_one("#now", NowPlaying).volume = self.player.volume
+        if was_active and self.queue.current is not None:
+            self._play_current(resume_at=position)
+        if announce:
+            if self._jukebox:
+                self.notify("jukebox mode — playing on the server", timeout=3)
+            else:
+                self.notify("local playback", timeout=2)
+
+    @staticmethod
+    def _jukebox_type():
+        from navitui.jukebox import JukeboxPlayer
+
+        return JukeboxPlayer
+
+    def _jukebox_unsupported(self, detail: str) -> None:
+        """The server refused a jukebox command (no permission / unsupported).
+        Fall back to local playback so music never just stops."""
+        if not self._jukebox:
+            return
+        self._jukebox = False
+        self.dirs.save_state({"jukebox": False})
+        self.notify(
+            f"jukebox unavailable ({detail}) — using local playback",
+            severity="warning",
+            timeout=6,
+        )
+        self._switch_player(jukebox=False, announce=False)
+
+    def action_toggle_jukebox(self) -> None:
+        if self.client is None:
+            return
+        target = not self._jukebox
+        self.dirs.save_state({"jukebox": target})
+        self._switch_player(jukebox=target)
+
     def _onboarded(self, config: dict | None) -> None:
         if not config:
             return
@@ -376,6 +448,12 @@ class NaviTuiApp(KitApp):
         self._load_playlists()
         self._flush_mutations()  # drain anything parked from a previous session
         self.run_worker(self._start_mpris(), group="mpris")
+        # now that a client exists, honor jukebox mode (config/persisted). The
+        # queue restored quietly, so don't auto-play — just swap the engine.
+        if self._jukebox and not isinstance(self.player, self._jukebox_type()):
+            self.player = self._make_player(jukebox=True)
+            self.player.set_volume(self.query_one("#now", NowPlaying).volume)
+            self._jukebox = isinstance(self.player, self._jukebox_type())
 
     async def _start_mpris(self) -> None:
         # dbus-fast runs on our own event loop, so media-key controls can
@@ -536,6 +614,11 @@ class NaviTuiApp(KitApp):
             now = self.query_one("#now", NowPlaying)
             level = None
             if self.player is not None:
+                # jukebox has no mpv thread: poll server status for position on
+                # this same heartbeat (no extra timer) so on_position still fires
+                poll = getattr(self.player, "poll", None)
+                if poll is not None:
+                    poll()
                 now.set_playing(self.player.active and not self.player.paused)
                 now.set_class(self.player.active, "playing")
                 level = self.player.level
@@ -882,6 +965,10 @@ class NaviTuiApp(KitApp):
         """Where to play `song` from: a pinned local file if we have one,
         else the server stream URL. In offline mode a missing pin means the
         track is unplayable (None)."""
+        # jukebox plays on the SERVER, which already has the originals — always
+        # hand it the stream URL (a local pin path means nothing to the server)
+        if self._jukebox and self.client is not None:
+            return self.client.stream_url(song.id)
         local = self.client.cached_stream(song.id) if self.client else None
         if local is not None:
             return str(local)
@@ -918,6 +1005,11 @@ class NaviTuiApp(KitApp):
                 now.set_playing(False)
                 self._render_queue()
                 return
+        # jukebox status doesn't reliably report track length; feed it the
+        # library duration so progress/seek math works (no-op for local mpv)
+        set_duration = getattr(self.player, "set_duration", None)
+        if set_duration is not None:
+            set_duration(song.duration)
         self.player.play(source, start=resume_at)
         now.set_song(song)
         now.set_progress(resume_at, song.duration)

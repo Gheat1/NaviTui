@@ -39,6 +39,7 @@ KEYBINDS = {
     "download_view":       "D",
     "download_all":        "ctrl+d",
     "offline_toggle":      "O",
+    "jukebox_toggle":      "J",
     "playlist_add":        "p",
     "lyrics":              "L",
     "share":               "S",
@@ -65,6 +66,7 @@ DEFAULTS = {
     "discord_app_id": "",         # discord.com/developers/applications
     "remote_control": True,       # local control API (unix socket) for the CLI/MCP
     "remote_token": "",           # optional shared secret; required on the TCP fallback
+    "jukebox": False,             # play on the SERVER's audio out, not this machine
 }
 
 _TEMPLATE = """\
@@ -97,6 +99,12 @@ _TEMPLATE = """\
 # off this machine. Set a token to require it (mandatory on the TCP fallback).
 #remote_control = true
 #remote_token = ""
+
+# Jukebox mode: play through the SERVER's own audio output (for a headless
+# Navidrome box wired to speakers) instead of decoding locally. Needs the
+# "jukebox" role on your account; falls back to local playback if the server
+# refuses. Toggle at runtime with J.
+#jukebox = false
 
 # Remap any key. Action ids and defaults:
 #[keybinds]

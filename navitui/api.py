@@ -219,6 +219,18 @@ class SubsonicClient:
     async def scrobble(self, song_id: str, submission: bool) -> None:
         await self._get("scrobble", id=song_id, submission="true" if submission else "false")
 
+    async def jukebox_control(self, action: str, **params) -> dict:
+        """Drive the server's OWN audio output via `jukeboxControl`.
+
+        action: get | status | set | start | stop | skip | add | clear |
+        remove | setGain. Params map straight onto the endpoint's query args:
+        `id` (song id, repeatable for add/set), `index`, `offset` (seek, whole
+        seconds), `gain` (0.0–1.0). Returns the full `subsonic-response` body
+        (`jukeboxStatus`/`jukeboxPlaylist`); needs the `jukebox` role — a lack
+        of permission surfaces as `SubsonicError` for the caller to fall back
+        on. See navitui/jukebox.py's JukeboxPlayer."""
+        return await self._get("jukeboxControl", action=action, **params)
+
     async def set_star(self, item_id: str, kind: str, star: bool) -> None:
         """kind: song | album | artist"""
         key = {"song": "id", "album": "albumId", "artist": "artistId"}[kind]
