@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 
 from rich.text import Text
 from textual import on, work
@@ -59,6 +60,13 @@ VIEWS = [
 ]
 VIEW_LABELS = dict(VIEWS)
 
+# playback speeds cycled by the speed action — 1.0 first so a fresh press
+# reads as "no change yet" only after it wraps back
+SPEED_STEPS = [1.0, 1.25, 1.5, 1.75, 2.0, 0.75]
+# sleep-timer presets: minutes, or 0 for off, or -1 for "stop at end of the
+# current track". Cycled by the sleep action; index 0 is always off.
+SLEEP_PRESETS = [0, 15, 30, 45, 60, -1]
+
 HELP_SECTIONS = [
     (
         "playback",
@@ -69,6 +77,8 @@ HELP_SECTIONS = [
             ("← / →", "seek 5s   (shift: 30s)"),
             ("- / +", "volume down / up"),
             ("m", "mute"),
+            (">", "cycle playback speed  (podcasts / audiobooks)"),
+            ("<", "sleep timer  off → 15 → 30 → 45 → 60 → end of track"),
             ("s", "toggle shuffle"),
             ("r", "cycle repeat  off → all → one"),
             ("i", "start radio from this track / artist"),
@@ -160,6 +170,8 @@ class NaviTuiApp(KitApp):
         _kb("volume_down", "volume(-5)"),
         _kb("volume_up", "volume(5)"),
         _kb("mute", "mute"),
+        _kb("speed", "cycle_speed"),
+        _kb("sleep_timer", "cycle_sleep"),
         _kb("enqueue", "enqueue(False)"),
         _kb("play_next", "enqueue(True)"),
         _kb("queue_remove", "queue_remove"),
@@ -264,6 +276,11 @@ class NaviTuiApp(KitApp):
         self._scrobbled = False
         self._end_failures = 0
         self._resume_position = 0.0
+        # sleep timer: an index into SLEEP_PRESETS. _sleep_deadline is a
+        # monotonic timestamp (checked inside the heartbeat, no extra timer);
+        # None means "off" or the special "stop at end of current track" mode.
+        self._sleep_idx = 0
+        self._sleep_deadline: float | None = None
         self._mutations = 0
         self._last_persist = 0.0
         self._queue_scrolled_to = -2
@@ -334,6 +351,7 @@ class NaviTuiApp(KitApp):
         self.player.set_volume(int(state.get("volume", 80)))
         now = self.query_one("#now", NowPlaying)
         now.volume = self.player.volume
+        now.speed = self.player.set_speed(float(state.get("speed", 1.0)))
 
         # restore the queue exactly as it was left
         cached_queue = self.dirs.read_cache("queue")
@@ -566,6 +584,14 @@ class NaviTuiApp(KitApp):
                 now.set_playing(self.player.active and not self.player.paused)
                 now.set_class(self.player.active, "playing")
                 level = self.player.level
+            # sleep-timer countdown: reuse this one heartbeat, no new timer.
+            # Show mm:ss remaining and fire (pause) when the deadline passes.
+            if self._sleep_deadline is not None:
+                remaining = self._sleep_deadline - time.monotonic()
+                if remaining <= 0:
+                    self._sleep_fire()
+                else:
+                    now.sleep_label = anim.fmt_time(remaining)
             now.tick(level)
             # drive the synced-lyrics highlight off this one heartbeat
             top = self.screen_stack[-1] if len(self.screen_stack) > 1 else None
@@ -1100,6 +1126,53 @@ class NaviTuiApp(KitApp):
         now.muted = self.player.toggle_mute()
         now.flash_volume()
 
+    # ── playback speed ────────────────────────────────────────────────
+    def action_cycle_speed(self) -> None:
+        """Step through common speeds — handy for podcasts and audiobooks."""
+        current = self.player.speed
+        idx = min(
+            range(len(SPEED_STEPS)),
+            key=lambda i: abs(SPEED_STEPS[i] - current),
+        )
+        speed = self.player.set_speed(SPEED_STEPS[(idx + 1) % len(SPEED_STEPS)])
+        now = self.query_one("#now", NowPlaying)
+        now.speed = speed
+        now.flash_speed()
+        self.dirs.save_state({"speed": speed})
+        self.notify(f"speed {speed:g}x", timeout=1.5)
+
+    # ── sleep timer ───────────────────────────────────────────────────
+    def action_cycle_sleep(self) -> None:
+        """Cycle off → 15 → 30 → 45 → 60 min → end of track → off. The
+        deadline is checked inside the heartbeat; there is no extra timer."""
+        self._sleep_idx = (self._sleep_idx + 1) % len(SLEEP_PRESETS)
+        preset = SLEEP_PRESETS[self._sleep_idx]
+        now = self.query_one("#now", NowPlaying)
+        if preset == 0:
+            self._sleep_deadline = None
+            now.sleep_label = ""
+            self.notify("sleep timer off", timeout=1.5)
+        elif preset == -1:
+            self._sleep_deadline = None  # fired from _on_track_end instead
+            now.sleep_label = "end"
+            self.notify("sleep: stopping at end of track", timeout=2)
+        else:
+            self._sleep_deadline = time.monotonic() + preset * 60
+            now.sleep_label = anim.fmt_time(preset * 60)
+            self.notify(f"sleep timer: {preset} min", timeout=2)
+
+    def _sleep_fire(self) -> None:
+        """Pause playback and clear the timer once a deadline passes."""
+        self._sleep_idx = 0
+        self._sleep_deadline = None
+        now = self.query_one("#now", NowPlaying)
+        now.sleep_label = ""
+        if self.player is not None and self.player.active and not self.player.paused:
+            self.player.set_paused(True)
+            now.set_playing(False)
+            self._announce()
+        self.notify("sleep timer — paused", timeout=5)
+
     def action_toggle_shuffle(self) -> None:
         on_now = self.queue.toggle_shuffle()
         self.query_one("#now", NowPlaying).shuffle = on_now
@@ -1234,6 +1307,19 @@ class NaviTuiApp(KitApp):
                 self.player.stop()
                 self.query_one("#now", NowPlaying).set_playing(False)
                 return
+        # sleep timer set to "stop at end of track": let this one finish, then
+        # stop rather than advancing, and clear the timer.
+        if not failed and SLEEP_PRESETS[self._sleep_idx] == -1:
+            self._sleep_idx = 0
+            now = self.query_one("#now", NowPlaying)
+            now.sleep_label = ""
+            self.player.stop()
+            now.set_playing(False)
+            now.set_progress(0.0, 0.0)
+            self._render_queue()
+            self._announce()
+            self.notify("sleep timer — stopped at end of track", timeout=5)
+            return
         drained_seed = self.queue.current  # the track that just finished
         song = self.queue.advance(natural=not failed)
         if song is not None:

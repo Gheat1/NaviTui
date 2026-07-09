@@ -209,6 +209,19 @@ class Player:
         self._m.mute = not self._m.mute
         return bool(self._m.mute)
 
+    # ── speed ─────────────────────────────────────────────────────────
+    @property
+    def speed(self) -> float:
+        try:
+            return float(self._m.speed or 1.0)
+        except Exception:
+            return 1.0
+
+    def set_speed(self, value: float) -> float:
+        value = max(0.25, min(4.0, float(value)))
+        self._m.speed = value
+        return value
+
     def terminate(self) -> None:
         self._closing = True  # observers go quiet before the core dies
         self._want_playing = False
@@ -228,6 +241,7 @@ class NullPlayer:
     volume = 100
     muted = False
     level = 0.0
+    speed = 1.0
 
     def __init__(self, *a, **kw) -> None:
         pass
@@ -255,6 +269,9 @@ class NullPlayer:
 
     def toggle_mute(self) -> bool:
         return False
+
+    def set_speed(self, value: float) -> float:
+        return value
 
     def terminate(self) -> None:
         pass

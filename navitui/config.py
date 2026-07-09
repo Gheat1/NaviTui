@@ -26,6 +26,8 @@ KEYBINDS = {
     "volume_down":         "minus",
     "volume_up":           "plus,equals_sign",
     "mute":                "m",
+    "speed":               "greater_than_sign",
+    "sleep_timer":         "less_than_sign",
     "enqueue":             "a",
     "play_next":           "A",
     "queue_remove":        "x",
