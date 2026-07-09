@@ -31,6 +31,8 @@ classifiers = [
 [project.optional-dependencies]
 # media keys / desktop widgets (linux) and discord rich presence
 integrations = ["dbus-fast>=2.21", "pypresence>=4.3"]
+# MCP server — control a running NaviTui from Claude Code / any MCP client
+mcp = ["mcp>=1.2"]
 
 [project.urls]
 Homepage = "https://github.com/Gheat1/NaviTui"
@@ -39,6 +41,7 @@ Issues = "https://github.com/Gheat1/NaviTui/issues"
 
 [project.scripts]
 navitui = "navitui:main"
+navitui-mcp = "navitui.mcp:main"
 
 [tool.setuptools]
 packages = ["navitui"]
