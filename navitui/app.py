@@ -902,7 +902,7 @@ class NaviTuiApp(KitApp):
         self._clear_selection()
         panel = self.query_one("#tracks-panel")
         panel.border_title = title
-        self._fill("#tracks-list", [self._song_row(s) for s in songs], "#tracks-panel")
+        self._fill("#tracks-list", [self._song_row(s, i) for i, s in enumerate(songs)], "#tracks-panel")
 
     @work(exclusive=True, group="songs")
     async def _load_view(self, view_id: str) -> None:
@@ -1027,7 +1027,9 @@ class NaviTuiApp(KitApp):
             self._show_songs(self._view_rows(self.view), self._tracks_title(self.view))
 
     # ── row rendering ─────────────────────────────────────────────────
-    def _song_row(self, s: Song) -> Option:
+    def _song_row(self, s: Song, index: int) -> Option:
+        # id is the row's position, not s.id: a playlist can list the same song
+        # twice and OptionList requires unique ids (handlers resolve by index)
         current = self.queue.current
         is_current = current is not None and s.id == current.id
         row = Text(no_wrap=True, overflow="ellipsis")
@@ -1046,7 +1048,7 @@ class NaviTuiApp(KitApp):
             row.append(f" {chr(0x2460 + s.user_rating - 1)}", style=palette.peach)  # ①-⑤
         row.append(f"  {s.artist}", style=palette.dim)
         row.append(f" · {anim.fmt_time(s.duration)}", style=palette.vfaint)
-        return Option(row, id=s.id)
+        return Option(row, id=f"trk-{index}")
 
     def _fill(self, selector: str, options: list[Option], subtitle_of: str | None = None) -> None:
         ol = self.query_one(selector, NavList)
@@ -1074,15 +1076,17 @@ class NaviTuiApp(KitApp):
     def _track_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if self.player is not None and self.player.active:
             return  # while playing, the cover belongs to the current song
-        song = next((s for s in self._songs if s.id == event.option.id), None)
+        view = self._tracks_view()
+        i = event.option_index
+        song = view[i] if i is not None and 0 <= i < len(view) else None
         if song is not None and song.cover_art:
             self._load_art(song.cover_art, f"song-{song.id}")
 
     @on(OptionList.OptionSelected, "#tracks-list")
     def _track_selected(self, event: OptionList.OptionSelected) -> None:
         view = self._tracks_view()
-        idx = next((i for i, s in enumerate(view) if s.id == event.option.id), None)
-        if idx is not None:
+        idx = event.option_index
+        if idx is not None and 0 <= idx < len(view):
             self._play_songs(view, idx)
 
     @on(OptionList.OptionSelected, "#queue-list")
@@ -1224,7 +1228,7 @@ class NaviTuiApp(KitApp):
         self._filtered = (
             [s for s in self._songs if self._matches(s, needle)] if needle else list(self._songs)
         )
-        self._fill("#tracks-list", [self._song_row(s) for s in self._filtered])
+        self._fill("#tracks-list", [self._song_row(s, i) for i, s in enumerate(self._filtered)])
         self._render_filter_bar()
 
     def _render_filter_bar(self) -> None:
@@ -1242,7 +1246,7 @@ class NaviTuiApp(KitApp):
         # restore the full list and let the heartbeat reset the subtitle
         panel = self.query_one("#tracks-panel")
         panel.border_subtitle = str(len(self._songs)) if self._songs else None
-        self._fill("#tracks-list", [self._song_row(s) for s in self._songs])
+        self._fill("#tracks-list", [self._song_row(s, i) for i, s in enumerate(self._songs)])
 
     # ── multi-select (bulk actions over a set of song ids) ─────────────
     # `v` toggles select mode; in it, `space` toggles the highlighted row and
@@ -1429,7 +1433,7 @@ class NaviTuiApp(KitApp):
     def _refresh_song_markers(self) -> None:
         """Re-render the tracks pane so the ♪ marker (and stars, ✓, ratings)
         follow the player — over the filtered view when one is active."""
-        self._fill("#tracks-list", [self._song_row(s) for s in self._tracks_view()])
+        self._fill("#tracks-list", [self._song_row(s, i) for i, s in enumerate(self._tracks_view())])
 
     def action_play_pause(self) -> None:
         if self.player.active:
