@@ -10,13 +10,33 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from navitui.models import Song
 
+# org.freedesktop.Notifications — the FreeDesktop notifications service.
+# Preferred on linux so we can attach action buttons and hear back which one
+# the user clicked; everything degrades to notify-send/osascript below.
+NOTIFY_SERVICE = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+
+# action buttons, in display order: (id, label). the id round-trips through
+# the ActionInvoked signal and maps to a control callback (see Notifier.start).
+NOTIFY_ACTIONS: list[tuple[str, str]] = [
+    ("previous", "⏮ Prev"),
+    ("play-pause", "⏯ Play/Pause"),
+    ("next", "⏭ Next"),
+]
+
 
 class Notifier:
-    """Desktop notification on track change. Linux: notify-send (with the
-    cached cover as the icon). macOS: osascript. Elsewhere: no-op."""
+    """Desktop notification on track change.
+
+    Preferred (linux, session bus reachable): the org.freedesktop.Notifications
+    dbus interface via dbus-fast — asyncio-native like MPRIS, so we can attach
+    action buttons and handle the ActionInvoked signal straight on the app's
+    event loop. Fallback: notify-send (linux) / osascript (macOS), no buttons.
+    Elsewhere: no-op. Notifications never block and never stop playback."""
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
@@ -25,14 +45,146 @@ class Notifier:
             self._tool = "notify-send"
         elif sys.platform == "darwin" and shutil.which("osascript"):
             self._tool = "osascript"
+        # dbus backend, populated by start(); None means "use _tool"
+        self._bus = None
+        self._controls: dict[str, Callable[[], None]] = {}
+        self._last_id = 0
 
     def toggle(self) -> bool:
         self.enabled = not self.enabled
         return self.enabled
 
-    def track(self, song: Song, art_path: Path | None = None) -> None:
-        if not self.enabled or self._tool is None:
+    async def start(self, controls: dict[str, Callable[[], None]]) -> bool:
+        """Connect to org.freedesktop.Notifications and route ActionInvoked to
+        the given control callbacks (keys: previous/play-pause/next). Returns
+        True when the dbus backend is live; on any failure we keep _tool.
+
+        Runs on the app's own event loop, so an invoked action calls the
+        control directly — no threads, exactly like MPRIS media keys."""
+        if not sys.platform.startswith("linux"):
+            return False
+        try:
+            from dbus_fast import Message, MessageType
+            from dbus_fast.aio import MessageBus
+        except ImportError:
+            return False
+        try:
+            bus = await MessageBus().connect()
+            # only claim dbus if the service actually answers, else fall back
+            reply = await bus.call(
+                Message(
+                    destination=NOTIFY_SERVICE,
+                    path=NOTIFY_PATH,
+                    interface=NOTIFY_SERVICE,
+                    member="GetCapabilities",
+                )
+            )
+            if reply is None or reply.message_type != MessageType.METHOD_RETURN:
+                bus.disconnect()
+                return False
+            # subscribe to ActionInvoked for our own notification ids
+            await bus.call(
+                Message(
+                    destination="org.freedesktop.DBus",
+                    path="/org/freedesktop/DBus",
+                    interface="org.freedesktop.DBus",
+                    member="AddMatch",
+                    signature="s",
+                    body=[
+                        f"type='signal',interface='{NOTIFY_SERVICE}',"
+                        "member='ActionInvoked'"
+                    ],
+                )
+            )
+            bus.add_message_handler(self._on_message)
+            self._bus = bus
+            self._controls = controls
+            return True
+        except Exception:
+            self._bus = None
+            return False
+
+    def _on_message(self, msg) -> None:
+        """dbus signal handler (on the event loop). ActionInvoked carries the
+        notification id we sent and the invoked action id; dispatch it to the
+        matching control if it targets our current notification."""
+        if (
+            msg.member != "ActionInvoked"
+            or msg.interface != NOTIFY_SERVICE
+            or not msg.body
+        ):
             return
+        notif_id = msg.body[0]
+        action = msg.body[1] if len(msg.body) > 1 else ""
+        if notif_id != self._last_id:
+            return
+        cb = self._controls.get(action)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def track(self, song: Song, art_path: Path | None = None) -> None:
+        if not self.enabled:
+            return
+        if self._bus is not None:
+            self._notify_dbus(song, art_path)
+            return
+        if self._tool is None:
+            return
+        self._notify_tool(song, art_path)
+
+    def _notify_dbus(self, song: Song, art_path: Path | None) -> None:
+        """Fire-and-forget Notify with action buttons on the event loop. The
+        reply (our new notification id) is captured so ActionInvoked can be
+        matched back to the currently shown notification."""
+        import asyncio
+
+        from dbus_fast import Message
+
+        body = f"{song.artist} · {song.album}" if song.album else song.artist
+        actions: list[str] = []
+        for action_id, label in NOTIFY_ACTIONS:
+            actions += [action_id, label]
+        icon = str(art_path) if art_path is not None else "NaviTui"
+        # hints: replace-in-place like the notify-send fallback, so repeated
+        # track changes update one bubble instead of stacking.
+        hints = {
+            "x-canonical-private-synchronous": _Variant("s", "navitui"),
+        }
+        msg = Message(
+            destination=NOTIFY_SERVICE,
+            path=NOTIFY_PATH,
+            interface=NOTIFY_SERVICE,
+            member="Notify",
+            signature="susssasa{sv}i",
+            body=[
+                "NaviTui",          # app_name
+                self._last_id,      # replaces_id (0 first time, then reuse)
+                icon,               # app_icon (cover path or name)
+                song.title,         # summary
+                body,               # body
+                actions,            # actions
+                hints,              # hints
+                4000,               # expire_timeout (ms)
+            ],
+        )
+
+        async def _send() -> None:
+            try:
+                reply = await self._bus.call(msg)
+                if reply is not None and reply.body:
+                    self._last_id = reply.body[0]
+            except Exception:
+                pass
+
+        try:
+            asyncio.get_running_loop().create_task(_send())
+        except RuntimeError:
+            pass
+
+    def _notify_tool(self, song: Song, art_path: Path | None) -> None:
         body = f"{song.artist} · {song.album}" if song.album else song.artist
         try:
             if self._tool == "notify-send":
@@ -52,6 +204,20 @@ class Notifier:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
+
+    def stop(self) -> None:
+        if self._bus is not None:
+            try:
+                self._bus.disconnect()
+            except Exception:
+                pass
+            self._bus = None
+
+
+def _Variant(sig: str, value):
+    from dbus_fast import Variant
+
+    return Variant(sig, value)
 
 
 def _esc(text: str) -> str:
