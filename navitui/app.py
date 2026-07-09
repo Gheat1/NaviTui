@@ -396,7 +396,9 @@ class NaviTuiApp(KitApp):
             or saved_view == "radio"
         ):
             self.view = saved_view
-        self._offline = bool(state.get("offline", False))
+        # offline mode is session-only: always start online so a stray `O`
+        # toggle can't silently strand every future launch offline
+        self._offline = False
         self._radio = bool(state.get("radio", False))
         # jukebox mode: config default, overridable by the last runtime toggle
         self._jukebox = bool(state.get("jukebox", CONFIG["jukebox"]))
@@ -2541,8 +2543,7 @@ class NaviTuiApp(KitApp):
         self._refresh_song_markers()
 
     def action_toggle_offline(self) -> None:
-        self._offline = not self._offline
-        self.dirs.save_state({"offline": self._offline})
+        self._offline = not self._offline  # session-only; not persisted
         self._render_status()
         self.notify(
             "offline mode — playing only downloaded tracks" if self._offline
