@@ -27,7 +27,7 @@ from ricekit.modals import HelpModal, PickerModal
 from ricekit.storage import AppDirs
 from ricekit.widgets import NavList, Splitter
 
-from navitui import anim, config as configmod, player as playermod
+from navitui import anim, artcolor, config as configmod, player as playermod
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, Notifier
@@ -623,6 +623,7 @@ class NaviTuiApp(KitApp):
         if song is None:
             self.player.stop()
             now.set_song(None)
+            self._tint_from_art(None)
             self._render_queue()
             return
         self.player.play(self.client.stream_url(song.id), start=resume_at)
@@ -632,6 +633,8 @@ class NaviTuiApp(KitApp):
         self._scrobble(song.id, False)
         if song.cover_art:
             self._load_art(song.cover_art, f"song-{song.id}")
+        else:
+            self._tint_from_art(None)
         self._render_queue()
         self._refresh_song_markers()
         self._persist_queue()
@@ -1072,8 +1075,21 @@ class NaviTuiApp(KitApp):
             path = await self.client.cover_art(cover_id)
         except Exception:
             panel.placeholder()
+            self._tint_from_art(None)
             return
         panel.show(path, key)
+        self._tint_from_art(path)
+
+    def _tint_from_art(self, path: Path | None) -> None:
+        """Live-tint the chrome with the cover's dominant color (or clear
+        it). Off unless enabled + truecolor; any failure leaves it untinted."""
+        if not CONFIG["art_theming"] or path is None:
+            artcolor.set_tint(None)
+            return
+        try:
+            artcolor.set_tint(artcolor.extract_vibrant(path))
+        except Exception:
+            artcolor.set_tint(None)
 
     # ── search ────────────────────────────────────────────────────────
     def action_search(self) -> None:
@@ -1150,6 +1166,9 @@ class NaviTuiApp(KitApp):
     def on_kit_theme_changed(self) -> None:
         if not self.kit_theme_previewing:
             self.dirs.save_state({"theme": self.theme})
+        # the palette was just rebuilt for the new theme — re-assert the
+        # album tint on top (a no-op under the ANSI `system` theme)
+        artcolor.reapply()
         self._render_status()
         if self.client is not None:
             self._render_sidebar()
