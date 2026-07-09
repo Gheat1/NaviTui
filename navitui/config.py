@@ -43,6 +43,7 @@ KEYBINDS = {
     "refresh":             "R",
     "theme_cycle":         "t",
     "theme_pick":          "T",
+    "zen":                 "z",
     "help":                "question_mark",
     "quit":                "q",
 }
