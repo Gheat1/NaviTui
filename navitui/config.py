@@ -56,6 +56,8 @@ DEFAULTS = {
     "art_theming": True,          # tint the chrome with the cover's color
     "discord_rich_presence": False,
     "discord_app_id": "",         # discord.com/developers/applications
+    "remote_control": True,       # local control API (unix socket) for the CLI/MCP
+    "remote_token": "",           # optional shared secret; required on the TCP fallback
 }
 
 _TEMPLATE = """\
@@ -78,6 +80,12 @@ _TEMPLATE = """\
 # from discord.com/developers/applications)
 #discord_rich_presence = false
 #discord_app_id = ""
+
+# Local remote-control API — a unix socket under $XDG_RUNTIME_DIR/navitui that
+# the navitui CLI and MCP server talk to. Localhost/socket only; never exposed
+# off this machine. Set a token to require it (mandatory on the TCP fallback).
+#remote_control = true
+#remote_token = ""
 
 # Remap any key. Action ids and defaults:
 #[keybinds]
