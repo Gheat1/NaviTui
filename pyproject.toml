@@ -31,6 +31,17 @@ classifiers = [
 [project.optional-dependencies]
 # media keys / desktop widgets (linux) and discord rich presence
 integrations = ["dbus-fast>=2.21", "pypresence>=4.3"]
+# native now-playing + media keys per OS (linux uses dbus-fast from integrations)
+macos = ["pyobjc-framework-MediaPlayer>=10", "pyobjc-framework-Cocoa>=10"]
+windows = [
+    "winrt-runtime>=3.0",
+    "winrt-Windows.Foundation>=3.0",
+    "winrt-Windows.Media>=3.0",
+    "winrt-Windows.Media.Interop>=3.0",
+    "winrt-Windows.Media.Playback>=3.0",
+    "winrt-Windows.Storage>=3.0",
+    "winrt-Windows.Storage.Streams>=3.0",
+]
 # MCP server — control a running NaviTui from Claude Code / any MCP client
 mcp = ["mcp>=1.2"]
 

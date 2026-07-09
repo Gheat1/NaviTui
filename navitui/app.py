@@ -33,7 +33,7 @@ from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, ListenBrainz, Notifier
 from navitui.models import Album, Artist, Bookmark, Genre, Playlist, PodcastChannel, Song
-from navitui.mpris import Mpris
+from navitui.nowplaying import create_nowplaying
 from navitui import mutations as mutations_mod
 from navitui.mutations import MutationQueue
 from navitui.palette import NaviTuiCommands
@@ -409,7 +409,7 @@ class NaviTuiApp(KitApp):
             bool(CONFIG["discord_rich_presence"]), str(CONFIG["discord_app_id"])
         )
         self.listenbrainz = ListenBrainz(str(CONFIG["listenbrainz_token"]))
-        self.mpris = Mpris()
+        self.mpris = create_nowplaying()  # MPRIS on linux, MPNowPlaying(mac)/SMTC(win) elsewhere
         self.remote = Remote()
 
         # start on the local engine; jukebox needs a client, so `_start` swaps
