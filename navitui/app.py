@@ -99,6 +99,7 @@ HELP_SECTIONS = [
         "library",
         [
             ("j / k / g / G", "move in lists"),
+            ("[count] j / k", "repeat a motion (3j moves down 3)"),
             ("h / l", "previous / next panel"),
             ("/", "search  (enter play · a queue · A play next)"),
             ("\\", "filter tracks pane  (type to narrow · esc clears)"),
@@ -233,6 +234,10 @@ class NaviTuiApp(KitApp):
         self._filtering = False
         self._filter_query = ""
         self._filtered: list[Song] = []
+        # vim repeat count: digits armed by the previous keystroke, consumed by
+        # the next motion (see _handle_count). Never spans more than the very
+        # next key — no timer keeps it alive.
+        self._count = ""
         # playback bookkeeping
         self._scrobbled = False
         self._end_failures = 0
@@ -802,8 +807,27 @@ class NaviTuiApp(KitApp):
         self._filtered = list(self._songs)
         self._render_filter_bar()
 
+    # keys the count buffer treats as a list motion, mapped to the NavList
+    # action that performs one step of it. j/k/down/up move by one row; g/G
+    # jump to the ends (a count there is meaningless, so it just runs once).
+    _COUNT_MOTIONS = {
+        "j": "cursor_down", "down": "cursor_down",
+        "k": "cursor_up", "up": "cursor_up",
+        "g": "first", "G": "last",
+    }
+    _COUNT_LISTS = {"tracks-list", "queue-list", "sidebar-list"}
+
     def on_key(self, event) -> None:
+        # vim repeat counts: a digit pressed on a focused list arms a count for
+        # the *next* keystroke. Digits 1-5 still rate the track immediately (the
+        # binding fires as normal — we don't consume the event); we only stash
+        # the pending count so an immediately-following motion repeats. This is
+        # the clean no-timer resolution of the digit/rating tension: a bare
+        # digit always rates, and `3j` moves three rows. Runs before the filter
+        # branch and before the binding system, but only when NOT filtering and
+        # a list is focused, so modals/search/transport are untouched.
         if not self._filtering:
+            self._handle_count(event)
             return
         key = event.key
         if key == "escape":
@@ -827,6 +851,44 @@ class NaviTuiApp(KitApp):
             self._apply_filter()
             event.prevent_default()
             event.stop()
+
+    def _handle_count(self, event) -> None:
+        """Apply / arm a vim repeat count for the focused list.
+
+        A count armed by the previous keystroke lives for exactly one key:
+        if this key is a motion, run it `count` times and consume the extra
+        steps; otherwise the count is dropped. Digits 1-9 (and 0 only when a
+        count is already building) re-arm the count and fall through so the
+        `rate` binding still fires — so a bare digit rates and `3j` moves
+        three rows. Only tracks/queue/sidebar; modals and search never reach
+        here because their own focus owns the keys."""
+        focused = self.focused
+        if focused is None or focused.id not in self._COUNT_LISTS:
+            self._count = ""
+            return
+        key = event.key
+        pending, self._count = self._count, ""  # consume; re-arm below if digit
+
+        action = self._COUNT_MOTIONS.get(key)
+        if action is not None and pending:
+            # let the first step run via the normal binding; drive the rest
+            # here, then swallow nothing — the binding still performs step one
+            try:
+                repeat = max(1, int(pending)) - 1
+            except ValueError:
+                repeat = 0
+            if action in ("first", "last"):
+                repeat = 0  # jumping to an end more than once is a no-op
+            for _ in range(min(repeat, 500)):  # cap: never loop unboundedly
+                getattr(focused, f"action_{action}")()
+            return
+
+        if len(key) == 1 and key.isdigit():
+            # arm the count for the next keystroke. Non-zero starts a count;
+            # 0 only extends one. Fall through (no prevent_default) so digits
+            # 1-5 still hit the rate binding.
+            if key != "0" or pending:
+                self._count = pending + key
 
     def _matches(self, song: Song, needle: str) -> bool:
         """Case-insensitive substring over title + artist, with a light
