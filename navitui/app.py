@@ -110,6 +110,7 @@ HELP_SECTIONS = [
         [
             ("t", "cycle kit themes"),
             ("T", "theme picker (live preview)"),
+            ("z", "zen / now-playing splash"),
             ("?", "this help"),
             ("q", "quit"),
         ],
@@ -152,6 +153,7 @@ class NaviTuiApp(KitApp):
         _kb("refresh", "refresh"),
         _kb("theme_cycle", "cycle_kit_theme", "theme", show=True),
         _kb("theme_pick", "change_theme"),
+        _kb("zen", "toggle_zen", "zen", show=True),
         _kb("help", "help", "help", show=True),
         _kb("quit", "quit", "quit", show=True),
         # rating is fixed on the number row (press again to clear)
@@ -174,6 +176,20 @@ class NaviTuiApp(KitApp):
     #queue-panel { height: 1fr; border: round $kit-border; }
 
     NowPlaying.playing { border: round $kit-border-alt; }
+
+    #zen-info { display: none; }
+
+    /* zen / now-playing splash: hide everything but a big centered cover,
+       the track info line and the animated transport (all still driven by
+       the one heartbeat — no extra timers). */
+    .zen #sidebar-panel, .zen #split1, .zen #tracks-panel,
+    .zen #split2, .zen #queue-panel { display: none; }
+    .zen #side { width: 1fr; align: center middle; }
+    .zen #art-panel {
+        width: 60%; height: 1fr; max-width: 72;
+        border: none; content-align: center middle;
+    }
+    .zen #zen-info { display: block; height: auto; margin: 1 0; }
     """
 
     def __init__(self, client: SubsonicClient | None = None, ao: str | None = None) -> None:
@@ -193,6 +209,7 @@ class NaviTuiApp(KitApp):
         self._mutations = 0
         self._last_persist = 0.0
         self._queue_scrolled_to = -2
+        self._zen = False
 
     # ── layout ────────────────────────────────────────────────────────
     def compose(self):
@@ -208,6 +225,7 @@ class NaviTuiApp(KitApp):
             yield Splitter("#side", invert=True, on_resized=self._persist_width, id="split2")
             with Vertical(id="side"):
                 yield CoverArt(id="art-panel")
+                yield Static(id="zen-info")
                 with Vertical(id="queue-panel", classes="panel"):
                     yield ClickList(id="queue-list")
         yield NowPlaying(id="now")
@@ -376,6 +394,8 @@ class NaviTuiApp(KitApp):
                 now.set_class(self.player.active, "playing")
                 level = self.player.level
             now.tick(level)
+            if self._zen:
+                self._render_zen_info()  # follow track changes in the splash
             busy = any(
                 not w.is_finished
                 for w in self.workers
@@ -1162,6 +1182,32 @@ class NaviTuiApp(KitApp):
 
     def action_help(self) -> None:
         self.push_screen(HelpModal(HELP_SECTIONS, title="NaviTui · keys"))
+
+    # ── zen / now-playing splash ──────────────────────────────────────
+    def action_toggle_zen(self) -> None:
+        self._zen = not self._zen
+        self.set_class(self._zen, "zen")
+        if self._zen:
+            self._render_zen_info()
+        else:
+            # restore focus to a sensible list when the panels come back
+            self.query_one("#tracks-list", ClickList).focus()
+
+    def _render_zen_info(self) -> None:
+        """The big title/artist/album block under the cover in zen mode."""
+        song = self.queue.current
+        info = self.query_one("#zen-info", Static)
+        t = Text(justify="center")
+        if song is None:
+            t.append("nothing playing", style=palette.dim)
+        else:
+            t.append(song.title, style=f"bold {palette.text}")
+            if song.starred:
+                t.append(f" {icons.STAR}", style=palette.yellow)
+            t.append(f"\n{song.artist}", style=palette.sub)
+            if song.album:
+                t.append(f"\n{song.album}", style=palette.dim)
+        info.update(t)
 
     def on_kit_theme_changed(self) -> None:
         if not self.kit_theme_previewing:
