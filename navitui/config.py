@@ -18,6 +18,7 @@ KEYBINDS = {
     "search":              "slash",
     "shuffle":             "s",
     "repeat":              "r",
+    "filter":              "backslash",
     "seek_back":           "left",
     "seek_forward":        "right",
     "seek_back_big":       "shift+left",
