@@ -35,6 +35,7 @@ KEYBINDS = {
     "playlist_add":        "p",
     "lyrics":              "L",
     "share":               "S",
+    "export_card":         "C",
     "go_album":            "e",
     "go_artist":           "E",
     "notifications":       "N",
