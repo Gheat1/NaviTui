@@ -27,7 +27,7 @@ from ricekit.modals import HelpModal, PickerModal
 from ricekit.storage import AppDirs
 from ricekit.widgets import NavList, Splitter
 
-from navitui import anim, artcolor, config as configmod, player as playermod
+from navitui import anim, artcolor, card, config as configmod, player as playermod
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, Notifier
@@ -102,6 +102,7 @@ HELP_SECTIONS = [
             ("e / E", "go to track's album / artist"),
             ("L", "lyrics"),
             ("S", "copy share link"),
+            ("C", "export now-playing card (SVG)"),
             ("R", "refresh from server"),
         ],
     ),
@@ -145,6 +146,7 @@ class NaviTuiApp(KitApp):
         _kb("playlist_add", "playlist_add"),
         _kb("lyrics", "lyrics"),
         _kb("share", "share"),
+        _kb("export_card", "export_card"),
         _kb("go_album", "go_album"),
         _kb("go_artist", "go_artist"),
         _kb("notifications", "toggle_notifications"),
@@ -1003,6 +1005,20 @@ class NaviTuiApp(KitApp):
             return
         self.copy_to_clipboard(url)
         self.notify(f"share link copied · {url}", timeout=5)
+
+    def action_export_card(self) -> None:
+        """Save the now-playing state as a shareable themed SVG card."""
+        song = self.queue.current
+        if song is None or self.player is None or not self.player.active:
+            self.notify("nothing playing to export", timeout=2)
+            return
+        path = card.export_path(song, self.dirs.cache_dir)
+        try:
+            card.export_svg(song, self.player.position, self.player.duration, path)
+        except Exception as e:
+            self.notify(f"couldn't export card: {e}", severity="warning", timeout=5)
+            return
+        self.notify(f"saved card · {path}", timeout=5)
 
     def action_go_album(self) -> None:
         song = self._target_song()
