@@ -71,6 +71,8 @@ HELP_SECTIONS = [
             ("m", "mute"),
             ("s", "toggle shuffle"),
             ("r", "cycle repeat  off → all → one"),
+            ("i", "start radio from this track / artist"),
+            ("I", "toggle endless radio (autoplay when queue drains)"),
         ],
     ),
     (
@@ -149,6 +151,8 @@ class NaviTuiApp(KitApp):
         _kb("queue_move_up", "queue_move(-1)"),
         _kb("queue_move_down", "queue_move(1)"),
         _kb("star", "star"),
+        _kb("start_radio", "start_radio"),
+        _kb("radio_toggle", "toggle_radio"),
         _kb("download", "download"),
         _kb("download_view", "download_view"),
         _kb("download_all", "download_all"),
@@ -229,6 +233,8 @@ class NaviTuiApp(KitApp):
         self._queue_scrolled_to = -2
         self._zen = False
         self._offline = False  # play/browse only what's pinned; skip the network
+        self._radio = False  # endless radio: refill the queue when it drains
+        self._radio_filling = False  # guard against a runaway refill loop
         self._dl_total = 0
         self._dl_done = 0
         self._dl_failed = 0
@@ -272,6 +278,7 @@ class NaviTuiApp(KitApp):
         if saved_view in VIEW_LABELS or saved_view.startswith("pl:"):
             self.view = saved_view
         self._offline = bool(state.get("offline", False))
+        self._radio = bool(state.get("radio", False))
 
         configmod.write_template(self.dirs.config_file.parent)
         self.notifier = Notifier(bool(CONFIG["notifications"]))
@@ -889,6 +896,76 @@ class NaviTuiApp(KitApp):
         self.dirs.save_state({"repeat": mode.value})
         self.notify(f"repeat {mode.value}", timeout=1.5)
 
+    # ── endless radio ─────────────────────────────────────────────────
+    def action_toggle_radio(self) -> None:
+        """Toggle autoplay-when-empty: keep pulling similar tracks forever."""
+        self._radio = not self._radio
+        self.dirs.save_state({"radio": self._radio})
+        self.notify(
+            "radio on — the queue refills itself" if self._radio else "radio off",
+            timeout=2,
+        )
+
+    def action_start_radio(self) -> None:
+        """Seed an endless station from the highlighted (or playing) track."""
+        song = self._target_song()
+        if song is None:
+            self.notify("highlight a track to start radio", timeout=2)
+            return
+        if self.client is None:
+            return
+        self._radio = True
+        self.dirs.save_state({"radio": True})
+        self.query_one("#now", NowPlaying).repeat = self.queue.repeat
+        self._play_songs([song], 0)  # start clean from the seed
+        self.notify(f"radio: {song.title}", timeout=3)
+        self._radio_refill(song, autoplay=False)  # prime the queue ahead
+
+    @work(exclusive=True, group="radio")
+    async def _radio_refill(self, seed: Song, autoplay: bool) -> None:
+        """Fetch a bounded batch of songs like `seed` and append them. Runs
+        off the UI thread. Falls back similar → top-songs → random, and stops
+        quietly if all of those come up empty. `_radio_filling` guards against
+        a runaway loop; ids already in the queue are dropped so we neither
+        spam duplicates nor immediately re-queue what just played."""
+        if self._radio_filling or self.client is None:
+            return
+        self._radio_filling = True
+        try:
+            batch: list[Song] = []
+            try:
+                batch = await self.client.get_similar_songs(seed.id, count=25)
+                if not batch and seed.artist_id:
+                    batch = await self.client.get_similar_songs(seed.artist_id, count=25)
+                if not batch and seed.artist:
+                    batch = await self.client.get_top_songs(seed.artist, count=25)
+                if not batch:
+                    batch = await self.client.get_random_songs(size=25)
+            except Exception:
+                batch = []
+            have = {s.id for s in self.queue.songs}
+            fresh = [s for s in batch if s.id not in have][:20]
+            if not fresh:
+                if autoplay:  # nothing to add and the queue is empty — stop calmly
+                    self.player.stop()
+                    now = self.query_one("#now", NowPlaying)
+                    now.set_playing(False)
+                    now.set_progress(0.0, 0.0)
+                    self._render_queue()
+                    self._announce()
+                    self.notify("radio: no more tracks to play", timeout=3)
+                return
+            self.queue.add(fresh)
+            if autoplay:
+                song = self.queue.advance(natural=False)
+                if song is not None:
+                    self._play_current()
+            else:
+                self._render_queue()
+                self._persist_queue()
+        finally:
+            self._radio_filling = False
+
     # ── mpv thread callbacks ──────────────────────────────────────────
     # These arrive on mpv's event thread and must NEVER block: a blocking
     # call_from_thread here deadlocks against player.terminate() on quit
@@ -940,9 +1017,14 @@ class NaviTuiApp(KitApp):
                 self.player.stop()
                 self.query_one("#now", NowPlaying).set_playing(False)
                 return
+        drained_seed = self.queue.current  # the track that just finished
         song = self.queue.advance(natural=not failed)
         if song is not None:
             self._play_current()
+        elif self._radio and drained_seed is not None and self.client is not None:
+            # queue ran dry with radio on: keep the music going by fetching a
+            # batch of similar songs seeded from the track that just played
+            self._radio_refill(drained_seed, autoplay=True)
         else:
             self.player.stop()
             now = self.query_one("#now", NowPlaying)
