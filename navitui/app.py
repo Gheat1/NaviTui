@@ -37,7 +37,9 @@ from navitui import mutations as mutations_mod
 from navitui.mutations import MutationQueue
 from navitui.playqueue import PlayQueue
 from navitui.remote import Remote, build_snapshot
-from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal
+from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal, StatsModal
+from navitui.stats import StatsStore
+from navitui import stats as statsmod
 from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
 
 # read once at import so the bindings table below can be built from it;
@@ -120,6 +122,7 @@ HELP_SECTIONS = [
         [
             ("t", "cycle kit themes"),
             ("T", "theme picker (live preview)"),
+            ("W", "listening stats / mini-wrapped"),
             ("z", "zen / now-playing splash"),
             ("?", "this help"),
             ("q", "quit"),
@@ -161,6 +164,7 @@ class NaviTuiApp(KitApp):
         _kb("offline_toggle", "toggle_offline"),
         _kb("playlist_add", "playlist_add"),
         _kb("lyrics", "lyrics"),
+        _kb("stats", "stats"),
         _kb("share", "share"),
         _kb("export_card", "export_card"),
         _kb("go_album", "go_album"),
@@ -221,6 +225,8 @@ class NaviTuiApp(KitApp):
         )
         self.client: SubsonicClient | None = client
         self._ao = ao
+        # local, offline listening stats — one JSONL append per confirmed play
+        self.stats = StatsStore(self.dirs.cache_dir)
         self.queue = PlayQueue()
         self.player = None
         self.view: str = "all-songs"  # sidebar view id (or "pl:<id>", or "artist:<id>")
@@ -1094,6 +1100,9 @@ class NaviTuiApp(KitApp):
             if position >= min(duration / 2, 240):
                 self._scrobbled = True
                 self._scrobble(song.id, True)
+                # a play is now "counted" — mirror it into the local stats log
+                # (cheap append; never blocks; matches the scrobble moment)
+                self.stats.log_play(song.id, song.title, song.artist)
         # crash-safe resume point, at most every 10s
         if position - self._last_persist >= 10 or position < self._last_persist:
             self._last_persist = position
@@ -1687,6 +1696,14 @@ class NaviTuiApp(KitApp):
 
     def action_help(self) -> None:
         self.push_screen(HelpModal(HELP_SECTIONS, title="NaviTui · keys"))
+
+    def action_stats(self) -> None:
+        """Open the local listening-stats modal — reads the play log on open
+        (cheap) and folds it into a summary; never touches the network."""
+        import time
+
+        summary = statsmod.summarize(self.stats.load(), time.time())
+        self.push_screen(StatsModal(summary))
 
     # ── zen / now-playing splash ──────────────────────────────────────
     def action_toggle_zen(self) -> None:

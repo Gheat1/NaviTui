@@ -41,6 +41,7 @@ KEYBINDS = {
     "offline_toggle":      "O",
     "playlist_add":        "p",
     "lyrics":              "L",
+    "stats":               "W",
     "share":               "S",
     "export_card":         "C",
     "go_album":            "e",

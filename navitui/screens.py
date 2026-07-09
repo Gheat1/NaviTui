@@ -19,7 +19,7 @@ from textual.widgets.option_list import Option
 from ricekit import icons, palette
 from ricekit.widgets import NavList, pop_in
 
-from navitui import anim
+from navitui import anim, stats as statsmod
 from navitui.api import SubsonicError, make_token, normalize_server
 from navitui.models import SearchResults
 from navitui.widgets import Logo, Visualizer
@@ -297,6 +297,119 @@ class LyricsModal(ModalScreen):
                 body.scroll_to(y=target, animate=False)
         except Exception:
             return  # mid-teardown race
+
+    def action_close_modal(self) -> None:
+        self.dismiss(None)
+
+
+class StatsModal(ModalScreen):
+    """Local listening stats — a mini "wrapped", read from the play log.
+
+    Purely offline: `summarize` folds the JSONL log into a Summary and this
+    renders it with the ricekit palette at paint time (never baked in), so it
+    restyles with the theme. Nerd-font icons are `\\uXXXX` escapes. Handles the
+    no-history case with an encouraging empty state rather than a blank box.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_modal", show=False),
+        Binding("q", "close_modal", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    StatsModal { align: center middle; background: $kit-overlay; }
+    StatsModal #stats-box {
+        width: 66; height: auto; max-height: 90%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    StatsModal Static { background: $kit-modal-bg; }
+    StatsModal #stats-head { height: 1; margin-bottom: 1; }
+    StatsModal #stats-body { height: auto; max-height: 30; scrollbar-size-vertical: 1; }
+    """
+
+    def __init__(self, summary: statsmod.Summary) -> None:
+        super().__init__()
+        self._summary = summary
+
+    def compose(self) -> ComposeResult:
+        from ricekit.widgets import KitScroll
+
+        with Vertical(id="stats-box"):
+            with Horizontal(id="stats-head"):
+                head = Text()
+                head.append(f"{statsmod.ICON_CHART} ", style=palette.mauve)
+                head.append("your listening", style=f"bold {palette.sub}")
+                yield Static(head, id="stats-title")
+            with KitScroll(id="stats-body"):
+                yield Static(self._render_stats(), id="stats-text")
+
+    def _render_stats(self) -> Text:
+        # (not `_render` — that name is a real internal method on every Widget)
+        s = self._summary
+        if s.empty:
+            out = Text("\n")
+            out.append(f"  {statsmod.ICON_MUSIC} no plays logged yet\n\n", style=palette.sub)
+            out.append(
+                "  play something for a while and it lands here —\n"
+                "  counted the same moment it scrobbles.\n",
+                style=palette.dim,
+            )
+            return out
+
+        out = Text("\n")
+        # totals line
+        out.append("  ", style=palette.text)
+        out.append(f"{s.total}", style=f"bold {palette.blue}")
+        out.append(" plays all-time", style=palette.dim)
+        out.append("   ·   ", style=palette.vfaint)
+        out.append(f"{s.week_total}", style=f"bold {palette.green}")
+        out.append(" this week", style=palette.dim)
+        if s.streak > 0:
+            out.append("   ·   ", style=palette.vfaint)
+            out.append(f"{statsmod.ICON_FIRE} {s.streak}", style=palette.peach)
+            out.append(f" day{'s' if s.streak != 1 else ''}", style=palette.dim)
+        out.append("\n\n")
+
+        # activity sparkline over the window
+        out.append(f"  {icons.CALENDAR} ", style=palette.lav)
+        out.append(f"last {s.days_window} days  ", style=palette.dim)
+        out.append(statsmod.sparkline(s.per_day), style=palette.mauve)
+        out.append("\n\n")
+
+        self._section(out, f"{icons.STAR} top tracks · this week", s.top_tracks_week
+                      or s.top_tracks_all, tracks=True)
+        out.append("\n")
+        self._section(out, f"{icons.USER} top artists · all time",
+                      s.top_artists_all, tracks=False)
+        return out
+
+    def _section(self, out: Text, title: str, rows, tracks: bool) -> None:
+        out.append(f"  {title}\n", style=f"bold {palette.sub}")
+        if not rows:
+            out.append("    nothing yet\n", style=palette.dim)
+            return
+        peak = max((r[-1] for r in rows), default=1) or 1
+        for i, row in enumerate(rows):
+            count = row[-1]
+            marker = f"{i + 1}."
+            out.append(f"    {marker:<3}", style=palette.vfaint)
+            if tracks:
+                title_text, artist = row[0], row[1]
+                out.append(title_text, style=palette.text)
+                if artist:
+                    out.append(f"  {artist}", style=palette.dim)
+            else:
+                out.append(row[0], style=palette.text)
+            # a little count bar so the leader board reads at a glance
+            bar = icons.bars(round((count / peak) * 3), palette.blue, palette.vfaint)
+            out.append("  ")
+            out.append_text(bar)
+            out.append(f" {count}\n", style=palette.vfaint)
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#stats-box"))
+        settle_pop_in(self, "#stats-box")
+        self.query_one("#stats-body").focus()
 
     def action_close_modal(self) -> None:
         self.dismiss(None)
