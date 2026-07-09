@@ -173,14 +173,26 @@ class FakeClient:
         every = [a for albums in self.albums.values() for a in albums]
         return every if list_type != "starred" else [a for a in every if a.starred]
 
+    # playlists persist in memory so edits (rename/remove/reorder/delete)
+    # round-trip like a real server; the defaults match the posed demo shots
+    def _seed_playlists(self):
+        if not hasattr(self, "_playlists"):
+            self._playlists = {
+                "pl1": Playlist(id="pl1", name="late night coding", song_count=14, duration=3300, owner="gheat"),
+                "pl2": Playlist(id="pl2", name="gym (do not judge)", song_count=9, duration=2100, owner="gheat"),
+            }
+            self._playlist_songs = {
+                "pl1": list(self.songs["al0"] + self.songs["al2"][:3]),
+                "pl2": list(self.songs["al1"]),
+            }
+
     async def get_playlists(self):
-        return [
-            Playlist(id="pl1", name="late night coding", song_count=14, duration=3300, owner="gheat"),
-            Playlist(id="pl2", name="gym (do not judge)", song_count=9, duration=2100, owner="gheat"),
-        ]
+        self._seed_playlists()
+        return list(self._playlists.values())
 
     async def get_playlist_songs(self, playlist_id):
-        return self.songs["al0"] + self.songs["al2"][:3]
+        self._seed_playlists()
+        return list(self._playlist_songs.get(playlist_id, []))
 
     async def get_starred(self):
         every_song = [s for songs in self.songs.values() for s in songs]
@@ -227,11 +239,51 @@ class FakeClient:
             out.extend(self.songs[a.id])
         return out
 
+    def _find_song(self, song_id):
+        for songs in self.songs.values():
+            for s in songs:
+                if s.id == song_id:
+                    return s
+        return None
+
     async def create_playlist(self, name, song_ids):
-        pass
+        self._seed_playlists()
+        pid = f"pl{len(self._playlists) + 1}"
+        entries = [s for sid in song_ids if (s := self._find_song(sid))]
+        self._playlists[pid] = Playlist(
+            id=pid, name=name, song_count=len(entries), owner="gheat"
+        )
+        self._playlist_songs[pid] = entries
 
     async def add_to_playlist(self, playlist_id, song_ids):
-        pass
+        self._seed_playlists()
+        entries = [s for sid in song_ids if (s := self._find_song(sid))]
+        self._playlist_songs.setdefault(playlist_id, []).extend(entries)
+        if playlist_id in self._playlists:
+            self._playlists[playlist_id].song_count = len(self._playlist_songs[playlist_id])
+
+    async def remove_from_playlist(self, playlist_id, indices):
+        self._seed_playlists()
+        songs = self._playlist_songs.get(playlist_id, [])
+        drop = set(indices)
+        self._playlist_songs[playlist_id] = [s for i, s in enumerate(songs) if i not in drop]
+        if playlist_id in self._playlists:
+            self._playlists[playlist_id].song_count = len(self._playlist_songs[playlist_id])
+
+    async def rename_playlist(self, playlist_id, name):
+        self._seed_playlists()
+        if playlist_id in self._playlists:
+            self._playlists[playlist_id].name = name
+
+    async def delete_playlist(self, playlist_id):
+        self._seed_playlists()
+        self._playlists.pop(playlist_id, None)
+        self._playlist_songs.pop(playlist_id, None)
+
+    async def reorder_playlist(self, playlist_id, song_ids):
+        self._seed_playlists()
+        by_id = {s.id: s for s in self._playlist_songs.get(playlist_id, [])}
+        self._playlist_songs[playlist_id] = [by_id[i] for i in song_ids if i in by_id]
 
     async def set_rating(self, song_id, rating):
         pass

@@ -83,7 +83,19 @@ HELP_SECTIONS = [
             ("x", "remove track (in queue panel)"),
             ("ctrl+↑ / ctrl+↓", "move track up / down"),
             ("X", "clear queue"),
+            ("ctrl+s", "save the queue as a new playlist"),
             ("", "played tracks dim out — scroll up for history"),
+        ],
+    ),
+    (
+        "playlists",
+        [
+            ("p", "add track to a playlist"),
+            ("P", "remove track from this playlist"),
+            ("shift+↑ / shift+↓", "move track up / down in the playlist"),
+            ("ctrl+r", "rename this playlist"),
+            ("ctrl+x", "delete this playlist"),
+            ("", "P / moves / rename / delete act on the open pl: view"),
         ],
     ),
     (
@@ -160,6 +172,12 @@ class NaviTuiApp(KitApp):
         _kb("download_all", "download_all"),
         _kb("offline_toggle", "toggle_offline"),
         _kb("playlist_add", "playlist_add"),
+        _kb("playlist_remove", "playlist_remove"),
+        _kb("playlist_move_up", "playlist_move(-1)"),
+        _kb("playlist_move_down", "playlist_move(1)"),
+        _kb("playlist_rename", "playlist_rename"),
+        _kb("playlist_delete", "playlist_delete"),
+        _kb("queue_save", "queue_save"),
         _kb("lyrics", "lyrics"),
         _kb("share", "share"),
         _kb("export_card", "export_card"),
@@ -1287,11 +1305,188 @@ class NaviTuiApp(KitApp):
             self._mutations -= 1
         playlist = next((p for p in self._playlists if p.id == playlist_id), None)
         self.notify(f"added to “{playlist.name if playlist else 'playlist'}”", timeout=3)
-        # the playlist's cached songs are stale now
+        self._invalidate_playlist(playlist_id)
+        self._load_playlists()
+
+    # ── editing the open playlist (pl:<id> view) ──────────────────────
+    def _open_playlist_id(self) -> str | None:
+        """The id of the playlist the tracks pane is showing, or None."""
+        return self.view.split(":", 1)[1] if self.view.startswith("pl:") else None
+
+    def _invalidate_playlist(self, playlist_id: str) -> None:
+        """The playlist's cached songs are stale after any edit."""
         try:
             (self.dirs.cache_dir / f"playlist-songs-{playlist_id}.json").unlink()
         except OSError:
             pass
+
+    def _playlist_track_index(self) -> int | None:
+        """Row index of the highlighted track within the open playlist view.
+        None unless a pl: view is open and the tracks list holds the cursor.
+        Filter mode is disallowed — indices must map onto the server order."""
+        if self._open_playlist_id() is None or self._filtering:
+            return None
+        focused = self.focused
+        if focused is None or focused.id != "tracks-list":
+            return None
+        ol = self.query_one("#tracks-list", NavList)
+        if ol.highlighted is None or ol.highlighted >= len(self._songs):
+            return None
+        return ol.highlighted
+
+    def action_playlist_remove(self) -> None:
+        """Remove the highlighted track from the currently-open playlist."""
+        pid = self._open_playlist_id()
+        idx = self._playlist_track_index()
+        if pid is None or idx is None:
+            self.notify("open a playlist and highlight a track to remove", timeout=3)
+            return
+        song = self._songs[idx]
+        # optimistic: drop it from the model and re-render, then persist
+        del self._songs[idx]
+        title = self._tracks_title(self.view)
+        self._show_songs(list(self._songs), title)
+        ol = self.query_one("#tracks-list", NavList)
+        if self._songs:
+            ol.highlighted = min(idx, len(self._songs) - 1)
+        self._playlist_remove_at(pid, idx, song.title)
+
+    @work(group="mutate")
+    async def _playlist_remove_at(self, playlist_id: str, index: int, title: str) -> None:
+        self._mutations += 1
+        try:
+            await self.client.remove_from_playlist(playlist_id, [index])
+        except Exception as e:
+            self.notify(f"couldn't remove track: {e}", severity="error", timeout=5)
+            self._invalidate_playlist(playlist_id)
+            if self.view == f"pl:{playlist_id}":
+                self._load_view(self.view)  # resync from the server
+            return
+        finally:
+            self._mutations -= 1
+        self.notify(f"removed “{title}”", timeout=2)
+        self._invalidate_playlist(playlist_id)
+        self._load_playlists()
+
+    def action_playlist_move(self, delta: int) -> None:
+        """Move the highlighted track up/down within the open playlist and
+        persist the new order to the server."""
+        pid = self._open_playlist_id()
+        idx = self._playlist_track_index()
+        if pid is None or idx is None:
+            return
+        new = idx + delta
+        if new < 0 or new >= len(self._songs):
+            return
+        # optimistic reorder in the model, then persist the full order
+        self._songs[idx], self._songs[new] = self._songs[new], self._songs[idx]
+        title = self._tracks_title(self.view)
+        self._show_songs(list(self._songs), title)
+        self.query_one("#tracks-list", NavList).highlighted = new
+        self._playlist_reorder(pid, [s.id for s in self._songs])
+
+    @work(group="mutate")
+    async def _playlist_reorder(self, playlist_id: str, song_ids: list[str]) -> None:
+        self._mutations += 1
+        try:
+            await self.client.reorder_playlist(playlist_id, song_ids)
+        except Exception as e:
+            self.notify(f"couldn't reorder playlist: {e}", severity="error", timeout=5)
+            self._invalidate_playlist(playlist_id)
+            if self.view == f"pl:{playlist_id}":
+                self._load_view(self.view)  # resync from the server
+            return
+        finally:
+            self._mutations -= 1
+        self._invalidate_playlist(playlist_id)
+
+    def action_playlist_rename(self) -> None:
+        pid = self._open_playlist_id()
+        if pid is None:
+            self.notify("open a playlist to rename it", timeout=3)
+            return
+        playlist = next((p for p in self._playlists if p.id == pid), None)
+        current = playlist.name if playlist else ""
+        self.push_screen(
+            InputModal("rename playlist", placeholder=current),
+            lambda name: self._playlist_rename(pid, name) if name else None,
+        )
+
+    @work(group="mutate")
+    async def _playlist_rename(self, playlist_id: str, name: str) -> None:
+        self._mutations += 1
+        try:
+            await self.client.rename_playlist(playlist_id, name)
+        except Exception as e:
+            self.notify(f"couldn't rename playlist: {e}", severity="error", timeout=5)
+            return
+        finally:
+            self._mutations -= 1
+        self.notify(f"renamed to “{name}”", timeout=3)
+        if self.view == f"pl:{playlist_id}":
+            self.query_one("#tracks-panel").border_title = name
+        self._load_playlists()
+
+    def action_playlist_delete(self) -> None:
+        pid = self._open_playlist_id()
+        if pid is None:
+            self.notify("open a playlist to delete it", timeout=3)
+            return
+        playlist = next((p for p in self._playlists if p.id == pid), None)
+        name = playlist.name if playlist else "this playlist"
+        options = [
+            Option(Text(f" {icons.CROSS_CIRCLE} delete “{name}”", style=palette.red), id="yes"),
+            Option(Text(f" {icons.CHECK_CIRCLE} keep it", style=palette.sub), id="no"),
+        ]
+
+        def confirmed(choice: str | None) -> None:
+            if choice == "yes":
+                self._playlist_delete(pid, name)
+
+        self.push_screen(PickerModal(f"delete “{name}”?", options), confirmed)
+
+    @work(group="mutate")
+    async def _playlist_delete(self, playlist_id: str, name: str) -> None:
+        self._mutations += 1
+        try:
+            await self.client.delete_playlist(playlist_id)
+        except Exception as e:
+            self.notify(f"couldn't delete playlist: {e}", severity="error", timeout=5)
+            return
+        finally:
+            self._mutations -= 1
+        self.notify(f"deleted “{name}”", timeout=3)
+        self._invalidate_playlist(playlist_id)
+        # fall back to the default view if we were looking at the deleted one
+        if self.view == f"pl:{playlist_id}":
+            self.view = "all-songs"
+            self.dirs.save_state({"view": self.view})
+            self._highlight_view(self.view)
+            self._load_view(self.view)
+        self._load_playlists()
+
+    def action_queue_save(self) -> None:
+        """Save the current play queue as a brand-new playlist."""
+        if not self.queue.songs:
+            self.notify("the queue is empty — nothing to save", timeout=2)
+            return
+        song_ids = [s.id for s in self.queue.songs]
+        self.push_screen(
+            InputModal("save queue as playlist", placeholder="name"),
+            lambda name: self._queue_save(name, song_ids) if name else None,
+        )
+
+    @work(group="mutate")
+    async def _queue_save(self, name: str, song_ids: list[str]) -> None:
+        self._mutations += 1
+        try:
+            await self.client.create_playlist(name, song_ids)
+        except Exception as e:
+            self.notify(f"couldn't save queue: {e}", severity="error", timeout=5)
+            return
+        finally:
+            self._mutations -= 1
+        self.notify(f"saved “{name}” · {len(song_ids)} tracks", timeout=3)
         self._load_playlists()
 
     # ── track extras: rating, lyrics, share, go-to ────────────────────

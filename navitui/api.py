@@ -125,6 +125,32 @@ class SubsonicClient:
     async def add_to_playlist(self, playlist_id: str, song_ids: list[str]) -> None:
         await self._get("updatePlaylist", playlistId=playlist_id, songIdToAdd=song_ids)
 
+    async def remove_from_playlist(self, playlist_id: str, indices: list[int]) -> None:
+        """Drop entries by their zero-based position (updatePlaylist's
+        songIndexToRemove — indices into the playlist as it stands server-side)."""
+        await self._get("updatePlaylist", playlistId=playlist_id, songIndexToRemove=indices)
+
+    async def rename_playlist(self, playlist_id: str, name: str) -> None:
+        await self._get("updatePlaylist", playlistId=playlist_id, name=name)
+
+    async def delete_playlist(self, playlist_id: str) -> None:
+        await self._get("deletePlaylist", id=playlist_id)
+
+    async def reorder_playlist(self, playlist_id: str, song_ids: list[str]) -> None:
+        """Persist an arbitrary new song order. Subsonic's updatePlaylist has no
+        move/reorder verb, so we rebuild the entry list in one call: clear every
+        current entry (songIndexToRemove for 0..n-1) and re-add the ids in the
+        desired order (songIdToAdd), both in the same request. Sending them
+        together is atomic server-side — removes apply first, then the adds — so
+        the playlist never briefly empties and metadata (name/owner) is kept."""
+        remove = list(range(len(song_ids)))
+        await self._get(
+            "updatePlaylist",
+            playlistId=playlist_id,
+            songIndexToRemove=remove,
+            songIdToAdd=song_ids,
+        )
+
     async def get_playlist_songs(self, playlist_id: str) -> list[Song]:
         body = await self._get("getPlaylist", id=playlist_id)
         return [Song.from_api(s) for s in body.get("playlist", {}).get("entry", [])]
