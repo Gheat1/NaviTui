@@ -339,6 +339,10 @@ class NaviTuiApp(KitApp):
         self._last_persist = 0.0
         self._queue_scrolled_to = -2
         self._zen = False
+        # zen splash lyrics: timed lines for the current song (or None), and the
+        # song id we last fetched for so the heartbeat refetches on track change
+        self._zen_lyrics: list[tuple[float, str]] | None = None
+        self._zen_lyrics_for: str | None = None
         self._offline = False  # play/browse only what's pinned; skip the network
         self._jukebox = False  # play on the server's audio out, not this machine
         self._radio = False  # endless radio: refill the queue when it drains
@@ -2690,20 +2694,73 @@ class NaviTuiApp(KitApp):
             self.query_one("#tracks-list", ClickList).focus()
 
     def _render_zen_info(self) -> None:
-        """The big title/artist/album block under the cover in zen mode."""
+        """The big title/artist/album block under the cover in zen mode, plus a
+        scrolling window of synced lyrics when the song has them."""
         song = self.queue.current
         info = self.query_one("#zen-info", Static)
         t = Text(justify="center")
         if song is None:
             t.append("nothing playing", style=palette.dim)
-        else:
-            t.append(song.title, style=f"bold {palette.text}")
-            if song.starred:
-                t.append(f" {icons.STAR}", style=palette.yellow)
-            t.append(f"\n{song.artist}", style=palette.sub)
-            if song.album:
-                t.append(f"\n{song.album}", style=palette.dim)
+            info.update(t)
+            return
+        t.append(song.title, style=f"bold {palette.text}")
+        if song.starred:
+            t.append(f" {icons.STAR}", style=palette.yellow)
+        t.append(f"\n{song.artist}", style=palette.sub)
+        if song.album:
+            t.append(f"\n{song.album}", style=palette.dim)
+        # fetch this song's timed lyrics once (the heartbeat calls us again as
+        # the fetch lands and as the position advances the highlighted line)
+        if self._zen_lyrics_for != song.id:
+            self._zen_lyrics_for = song.id
+            self._zen_lyrics = None
+            self._fetch_zen_lyrics(song)
+        window = self._zen_lyric_window()
+        if window is not None:
+            t.append("\n\n")
+            t.append_text(window)
         info.update(t)
+
+    @work(exclusive=True, group="zen-lyrics")
+    async def _fetch_zen_lyrics(self, song: Song) -> None:
+        get_synced = getattr(self.client, "get_synced_lyrics", None)
+        if get_synced is None:
+            return
+        try:
+            synced = await get_synced(song.id)
+        except Exception:
+            synced = None
+        # only apply if we're still in zen and on the same song
+        if self._zen and self.queue.current is not None and self.queue.current.id == song.id:
+            self._zen_lyrics = synced
+
+    def _zen_lyric_window(self, radius: int = 3) -> Text | None:
+        """A centred window of synced lyrics around the current line, or None
+        when the song has no timed lyrics."""
+        synced = self._zen_lyrics
+        if not synced:
+            return None
+        position = self.player.position if self.player else 0.0
+        current = -1
+        for i, (start, _) in enumerate(synced):
+            if start <= position:
+                current = i
+            else:
+                break
+        out = Text(justify="center")
+        anchor = current if current >= 0 else 0
+        lo = max(0, anchor - radius)
+        hi = min(len(synced), anchor + radius + 1)
+        for i in range(lo, hi):
+            line = synced[i][1] or " "
+            if i == current:
+                style = f"bold {palette.blue}"
+            elif abs(i - current) == 1:
+                style = palette.sub
+            else:
+                style = palette.dim
+            out.append(line + "\n", style=style)
+        return out
 
     def on_kit_theme_changed(self) -> None:
         if not self.kit_theme_previewing:
