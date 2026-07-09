@@ -32,7 +32,7 @@ from navitui import anim, artcolor, card, config as configmod, player as playerm
 from navitui.api import SubsonicClient, SubsonicError
 from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, ListenBrainz, Notifier
-from navitui.models import Album, Artist, Bookmark, Genre, Playlist, Song
+from navitui.models import Album, Artist, Bookmark, Genre, Playlist, PodcastChannel, Song
 from navitui.mpris import Mpris
 from navitui import mutations as mutations_mod
 from navitui.mutations import MutationQueue
@@ -50,6 +50,11 @@ CONFIG = configmod.load(AppDirs("navitui").config_file.parent)
 
 # nf-fa-bookmark — as a \uXXXX escape (raw PUA glyphs don't survive patching)
 BOOKMARK_GLYPH = "\uf02e"
+
+# nerd-font glyphs kept as \uXXXX escapes (raw PUA does not survive patch
+# tooling): nf-fa-podcast + nf-fa-broadcast_tower for the two new sections
+PODCAST_GLYPH = "\uf2ce"
+RADIO_GLYPH = "\uf519"
 
 
 def _kb(action_id: str, action: str, description: str = "", show: bool = False) -> Binding:
@@ -297,6 +302,8 @@ class NaviTuiApp(KitApp):
         self.view: str = "all-songs"  # sidebar view id (or "pl:<id>", or "artist:<id>")
         self._songs: list[Song] = []  # the full tracks-pane model
         self._playlists: list[Playlist] = []
+        self._podcasts: list[tuple[PodcastChannel, list[Song]]] = []  # channels + episodes
+        self._stations: list[Song] = []  # internet-radio stations as playable rows
         # type-to-filter: an explicit mode over the tracks pane. `_filtering`
         # captures keys in on_key so bare typing never fires a global bind;
         # `_filtered` is the derived view the list renders while active, so
@@ -369,7 +376,11 @@ class NaviTuiApp(KitApp):
         self.query_one("#art-panel", CoverArt).border_title = "cover"
         self.query_one("#queue-panel").border_title = "queue"
         saved_view = state.get("view", "all-songs")
-        if saved_view in VIEW_LABELS or saved_view.startswith("pl:"):
+        if (
+            saved_view in VIEW_LABELS
+            or saved_view.startswith(("pl:", "podcast:"))
+            or saved_view == "radio"
+        ):
             self.view = saved_view
         self._offline = bool(state.get("offline", False))
         self._radio = bool(state.get("radio", False))
@@ -460,11 +471,13 @@ class NaviTuiApp(KitApp):
         cached = self.dirs.read_cache("playlists")
         if cached:
             self._playlists = [Playlist.from_dict(p) for p in cached.get("playlists", [])]
+        self._restore_podcasts_radio()
         self._render_sidebar()
         sidebar = self.query_one("#sidebar-list", ClickList)
         sidebar.focus()
         self._highlight_view(self.view)
         self._load_playlists()
+        self._load_podcasts_radio()
         self._flush_mutations()  # drain anything parked from a previous session
         self.run_worker(self._start_mpris(), group="mpris")
 
@@ -702,6 +715,28 @@ class NaviTuiApp(KitApp):
         new_row.append("new playlist", style=palette.sub)
         options.append(Option(new_row, id="pl-new"))
 
+        # podcasts: one row per subscribed channel → its episodes; the section
+        # only appears once the server tells us there are any (no empty header)
+        if self._podcasts:
+            options.append(Option(Text(" "), disabled=True))
+            options.append(Option(Text(" podcasts", style=f"bold {palette.dim}"), disabled=True))
+            for channel, episodes in self._podcasts:
+                row = Text(no_wrap=True, overflow="ellipsis")
+                row.append(f"{PODCAST_GLYPH} ", style=palette.green)
+                row.append(channel.title, style=palette.text)
+                row.append(f" {len(episodes)}", style=palette.vfaint)
+                options.append(Option(row, id=f"podcast:{channel.id}"))
+
+        # internet radio: a single row loading every station into the pane
+        if self._stations:
+            options.append(Option(Text(" "), disabled=True))
+            options.append(Option(Text(" internet radio", style=f"bold {palette.dim}"), disabled=True))
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append(f"{RADIO_GLYPH} ", style=palette.blue)
+            row.append("stations", style=palette.text)
+            row.append(f" {len(self._stations)}", style=palette.vfaint)
+            options.append(Option(row, id="radio"))
+
         had_focus = ol.has_focus
         ol.clear_options()
         ol.add_options(options)
@@ -748,7 +783,21 @@ class NaviTuiApp(KitApp):
             pid = view_id.split(":", 1)[1]
             playlist = next((p for p in self._playlists if p.id == pid), None)
             return playlist.name if playlist else "playlist"
+        if view_id.startswith("podcast:"):
+            cid = view_id.split(":", 1)[1]
+            channel = next((c for c, _ in self._podcasts if c.id == cid), None)
+            return f"podcast · {channel.title}" if channel else "podcast"
+        if view_id == "radio":
+            return "internet radio"
         return VIEW_LABELS.get(view_id, "tracks")
+
+    def _view_rows(self, view_id: str) -> list[Song]:
+        """The playable rows for a podcast channel / the radio view, straight
+        from the in-memory state loaded by `_load_podcasts_radio`."""
+        if view_id == "radio":
+            return list(self._stations)
+        cid = view_id.split(":", 1)[1]
+        return next((list(eps) for c, eps in self._podcasts if c.id == cid), [])
 
     def _show_songs(self, songs: list[Song], title: str) -> None:
         self._songs = songs
@@ -784,6 +833,11 @@ class NaviTuiApp(KitApp):
 
             async def fetch(p=pid):
                 return await self.client.get_playlist_songs(p)
+        elif view_id.startswith("podcast:") or view_id == "radio":
+            # episodes / stations already live in memory (fetched + cached by
+            # `_load_podcasts_radio`); just drop the rows into the pane
+            self._show_songs(self._view_rows(view_id), title)
+            return
         else:
             return
 
@@ -836,6 +890,47 @@ class NaviTuiApp(KitApp):
         self.dirs.write_cache("playlists", {"playlists": [p.to_dict() for p in playlists]})
         self._playlists = playlists
         self._render_sidebar()
+
+    def _restore_podcasts_radio(self) -> None:
+        """Rehydrate podcasts + stations from cache so their sidebar sections
+        render instantly on launch (before the network worker runs)."""
+        cached = self.dirs.read_cache("podcasts")
+        if cached:
+            self._podcasts = [
+                (PodcastChannel.from_dict(c), [Song.from_dict(s) for s in eps])
+                for c, eps in cached.get("channels", [])
+            ]
+        cached = self.dirs.read_cache("radio")
+        if cached:
+            self._stations = [Song.from_dict(s) for s in cached.get("stations", [])]
+
+    @work(exclusive=True, group="lib")
+    async def _load_podcasts_radio(self) -> None:
+        """Refresh podcast channels+episodes and radio stations off the network.
+        Each half degrades on its own: a server without podcasts (or radio)
+        just leaves that section absent, never an error."""
+        if self.client is None:
+            return
+        try:
+            self._podcasts = await self.client.get_podcasts()
+        except Exception:
+            pass  # no podcasts / older server — keep whatever cache we had
+        else:
+            self.dirs.write_cache("podcasts", {
+                "channels": [
+                    [c.to_dict(), [s.to_dict() for s in eps]] for c, eps in self._podcasts
+                ]
+            })
+        try:
+            self._stations = await self.client.get_internet_radio_stations()
+        except Exception:
+            pass
+        else:
+            self.dirs.write_cache("radio", {"stations": [s.to_dict() for s in self._stations]})
+        self._render_sidebar()
+        # if the pane is showing a podcast/radio view, refresh its rows in place
+        if self.view.startswith("podcast:") or self.view == "radio":
+            self._show_songs(self._view_rows(self.view), self._tracks_title(self.view))
 
     # ── row rendering ─────────────────────────────────────────────────
     def _song_row(self, s: Song) -> Option:
@@ -1084,6 +1179,10 @@ class NaviTuiApp(KitApp):
         """Where to play `song` from: a pinned local file if we have one,
         else the server stream URL. In offline mode a missing pin means the
         track is unplayable (None)."""
+        # internet-radio stations carry a direct URL mpv opens as-is; they are
+        # live streams, so never pinned and never available offline
+        if song.stream_url:
+            return None if self._offline else song.stream_url
         local = self.client.cached_stream(song.id) if self.client else None
         if local is not None:
             return str(local)
@@ -2199,6 +2298,9 @@ class NaviTuiApp(KitApp):
         if song is None:
             self.notify("highlight a track to download", timeout=2)
             return
+        if song.stream_url:  # live radio stream — nothing to pin
+            self.notify("internet radio can't be downloaded", timeout=2)
+            return
         if self.client is not None and self.client.cached_stream(song.id):
             self.notify(f"already downloaded: {song.title}", timeout=2)
             return
@@ -2229,7 +2331,8 @@ class NaviTuiApp(KitApp):
         cheaply so re-runs are near-instant."""
         if self.client is None:
             return
-        pending = [s for s in songs if not self.client.cached_stream(s.id)]
+        # skip live radio streams (stream_url set) — only real files pin
+        pending = [s for s in songs if not s.stream_url and not self.client.cached_stream(s.id)]
         if not pending:
             self.notify(f"{label}: already downloaded", timeout=2)
             return
@@ -2391,7 +2494,8 @@ class NaviTuiApp(KitApp):
 
     def action_refresh(self) -> None:
         self._load_playlists()
-        if not self.view.startswith(("artist:", "album:", "genre:")):
+        self._load_podcasts_radio()  # re-pull feeds + stations (refreshes pane)
+        if not self.view.startswith(("artist:", "album:", "genre:", "podcast:")) and self.view != "radio":
             self._load_view(self.view)  # ad-hoc views have no sidebar entry
         self.notify("refreshing", timeout=1.5)
 
@@ -2401,7 +2505,8 @@ class NaviTuiApp(KitApp):
         if self.screen is not self.screen_stack[0]:
             return  # modal open — don't yank state around underneath it
         self._load_playlists()
-        if not self.view.startswith(("artist:", "album:", "genre:")):
+        self._load_podcasts_radio()
+        if not self.view.startswith(("artist:", "album:", "genre:", "podcast:")) and self.view != "radio":
             self._load_view(self.view)
         # if we're reachable enough to auto-refresh, try draining the queue too;
         # the flush worker no-ops when offline or empty and re-parks on failure
