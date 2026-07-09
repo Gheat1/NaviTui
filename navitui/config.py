@@ -51,6 +51,7 @@ KEYBINDS = {
     "playlist_delete":     "ctrl+x",
     "queue_save":          "ctrl+s",
     "lyrics":              "L",
+    "stats":               "ctrl+w",
     "share":               "S",
     "export_card":         "C",
     "go_album":            "e",
