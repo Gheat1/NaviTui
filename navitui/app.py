@@ -34,6 +34,7 @@ from navitui.integrations import DiscordPresence, Notifier
 from navitui.models import Album, Artist, Playlist, Song
 from navitui.mpris import Mpris
 from navitui.playqueue import PlayQueue
+from navitui.remote import Remote, build_snapshot
 from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal
 from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
 
@@ -258,6 +259,7 @@ class NaviTuiApp(KitApp):
             bool(CONFIG["discord_rich_presence"]), str(CONFIG["discord_app_id"])
         )
         self.mpris = Mpris()
+        self.remote = Remote()
 
         self.player = playermod.create_player(
             self._mpv_position,
@@ -284,6 +286,10 @@ class NaviTuiApp(KitApp):
 
         self.set_interval(1 / 8, self._heartbeat)
         self.set_interval(180, self._maybe_auto_refresh)
+
+        # local control API — transport + state work without a server
+        # connection, so start it here (not in _start) regardless of onboarding
+        self.run_worker(self._start_remote(), group="remote")
 
         if not playermod.MPV_AVAILABLE:
             self.notify(playermod.INSTALL_HINTS, severity="warning", timeout=15)
@@ -348,6 +354,102 @@ class NaviTuiApp(KitApp):
         if await self.mpris.start(controls):
             self._announce()
 
+    async def _start_remote(self) -> None:
+        # asyncio server on our own loop (like mpris): every handler drives an
+        # existing app action. Handlers take an args dict, return a dict or
+        # None. Wrapped so a startup failure can never stop the app.
+        p = self.player
+
+        def _seek(a: dict) -> None:
+            if "to" in a:
+                self.player.seek_to((float(a["to"]) / max(1.0, self.player.duration)))
+            else:
+                self.action_seek(float(a.get("delta", 0)))
+
+        def _volume(a: dict) -> dict:
+            if "set" in a:
+                self.set_volume_fraction(max(0, min(130, int(a["set"]))) / 100)
+            else:
+                self.action_volume(int(a.get("delta", 0)))
+            return {"volume": self.player.volume}
+
+        controls = {
+            "play_pause": lambda a: self.action_play_pause(),
+            "play": lambda a: (p.set_paused(False) if p.active else self.action_play_pause()),
+            "pause": lambda a: p.set_paused(True) or self._announce(),
+            "stop": lambda a: self._external_stop(),
+            "next": lambda a: self.action_next_track(),
+            "prev": lambda a: self.action_prev_track(),
+            "seek": _seek,
+            "volume": _volume,
+            "mute": lambda a: self.action_mute(),
+            "shuffle": lambda a: self.action_toggle_shuffle(),
+            "repeat": lambda a: self.action_cycle_repeat(),
+            "search": self._remote_search,
+            "enqueue": self._remote_enqueue,
+        }
+        try:
+            ok = await self.remote.start(
+                controls,
+                self._remote_snapshot,
+                self.dirs.cache_dir,
+                token=str(CONFIG["remote_token"]),
+                enabled=bool(CONFIG["remote_control"]),
+            )
+        except Exception:
+            ok = False
+        if ok:
+            self.remote.publish(self._remote_snapshot())
+
+    def _remote_snapshot(self) -> dict:
+        active = bool(self.player and self.player.active)
+        playing = active and not (self.player and self.player.paused)
+        return build_snapshot(
+            self.queue.current if active else None,
+            self.queue.songs,
+            self.queue.index,
+            self.player.position if self.player else 0.0,
+            self.player.volume if self.player else 0,
+            bool(self.player and self.player.muted),
+            playing,
+            active,
+            self.queue.shuffle,
+            self.queue.repeat.value,
+        )
+
+    async def _remote_search(self, a: dict) -> dict:
+        if self.client is None:
+            return {"songs": [], "albums": [], "artists": []}
+        res = await self.client.search(str(a.get("query", "")), int(a.get("limit", 20)))
+        return {
+            "songs": [s.to_dict() for s in res.songs],
+            "albums": [al.to_dict() for al in res.albums],
+            "artists": [ar.to_dict() for ar in res.artists],
+        }
+
+    async def _remote_enqueue(self, a: dict) -> dict:
+        """Queue a searched song by id (now or next). Looks it up via search
+        so a client only needs the id it already saw in a `search` result."""
+        song_id = str(a.get("song_id", ""))
+        if self.client is None or not song_id:
+            return {"queued": False}
+        song = next((s for s in self._songs if s.id == song_id), None)
+        if song is None:
+            song = next((s for s in self.queue.songs if s.id == song_id), None)
+        if song is None:  # not on screen: re-fetch via search
+            res = await self.client.search(song_id, 20)
+            song = next((s for s in res.songs if s.id == song_id), None)
+        if song is None:
+            return {"queued": False}
+        if a.get("next"):
+            self.queue.add_next([song])
+        else:
+            self.queue.add([song])
+        self._render_queue()
+        self._persist_queue()
+        self._announce()
+        return {"queued": True, "title": song.title}
+
     def _external_stop(self) -> None:
         self.player.stop()
         now = self.query_one("#now", NowPlaying)
@@ -376,6 +478,7 @@ class NaviTuiApp(KitApp):
         )
         if track_change and song is not None:
             self.notifier.track(song, art)
+        self.remote.publish(self._remote_snapshot())
 
     def _render_status(self) -> None:
         if self.client is None:
@@ -1253,6 +1356,7 @@ class NaviTuiApp(KitApp):
 
     async def action_quit(self) -> None:
         self.mpris.stop()
+        self.remote.stop()
         self.discord.stop()
         if self.player is not None:
             self._persist_queue()
