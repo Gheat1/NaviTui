@@ -33,6 +33,8 @@ from navitui.art import CoverArt
 from navitui.integrations import DiscordPresence, Notifier
 from navitui.models import Album, Artist, Playlist, Song
 from navitui.mpris import Mpris
+from navitui import mutations as mutations_mod
+from navitui.mutations import MutationQueue
 from navitui.playqueue import PlayQueue
 from navitui.remote import Remote, build_snapshot
 from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal
@@ -205,6 +207,12 @@ class NaviTuiApp(KitApp):
     def __init__(self, client: SubsonicClient | None = None, ao: str | None = None) -> None:
         super().__init__()
         self.dirs = AppDirs("navitui")
+        # pending library writes to replay when the server comes back (or when
+        # offline mode is switched off); survives restart via the JSON cache
+        self.mutations = MutationQueue(
+            lambda: self.dirs.read_cache(mutations_mod.CACHE_KEY),
+            lambda data: self.dirs.write_cache(mutations_mod.CACHE_KEY, data),
+        )
         self.client: SubsonicClient | None = client
         self._ao = ao
         self.queue = PlayQueue()
@@ -350,6 +358,7 @@ class NaviTuiApp(KitApp):
         sidebar.focus()
         self._highlight_view(self.view)
         self._load_playlists()
+        self._flush_mutations()  # drain anything parked from a previous session
         self.run_worker(self._start_mpris(), group="mpris")
 
     async def _start_mpris(self) -> None:
@@ -1117,11 +1126,19 @@ class NaviTuiApp(KitApp):
 
     @work(group="mutate")
     async def _rate(self, song_id: str, rating: int) -> None:
+        if self._offline:
+            self.mutations.rate(song_id, rating)
+            self._note_queued()
+            return
         self._mutations += 1
         try:
             await self.client.set_rating(song_id, rating)
         except Exception as e:
-            self.notify(f"couldn't set rating: {e}", severity="warning")
+            if self._is_network_error(e):
+                self.mutations.rate(song_id, rating)
+                self._note_queued()
+            else:
+                self.notify(f"couldn't set rating: {e}", severity="warning")
         finally:
             self._mutations -= 1
 
@@ -1225,6 +1242,33 @@ class NaviTuiApp(KitApp):
         ol.highlighted = new
         self._persist_queue()
 
+    # ── offline mutation queue ────────────────────────────────────────
+    @staticmethod
+    def _is_network_error(error: Exception) -> bool:
+        """A connectivity failure (park the mutation) vs. a server rejection
+        (a bad id — surface it, don't retry forever). Mirrors the split in
+        `_connection_trouble`: SubsonicError is the server saying no."""
+        return not isinstance(error, SubsonicError)
+
+    def _note_queued(self) -> None:
+        """Unobtrusive breadcrumb that a write is parked for later."""
+        n = self.mutations.pending
+        self.notify(f"offline — {n} change{'s' if n != 1 else ''} queued", timeout=2)
+
+    @work(group="flush")
+    async def _flush_mutations(self) -> None:
+        """Replay parked stars/ratings/scrobbles once we look online again.
+        Runs off the UI thread; drops each op on success, keeps the rest on the
+        first network failure so order and intent are preserved."""
+        if self.client is None or self._offline or not self.mutations.pending:
+            return
+        try:
+            flushed = await self.mutations.flush(self.client, self._is_network_error)
+        except Exception:
+            return
+        if flushed:
+            self.notify(f"synced {flushed} queued change{'s' if flushed != 1 else ''}", timeout=2)
+
     # ── starring ──────────────────────────────────────────────────────
     def action_star(self) -> None:
         song = self._highlighted_song()
@@ -1241,11 +1285,20 @@ class NaviTuiApp(KitApp):
 
     @work(group="mutate")
     async def _star(self, item_id: str, kind: str, star: bool) -> None:
+        # offline mode: never touch the network — the cache already reflects it
+        if self._offline:
+            self.mutations.star(item_id, kind, star)
+            self._note_queued()
+            return
         self._mutations += 1
         try:
             await self.client.set_star(item_id, kind, star)
         except Exception as e:
-            self.notify(f"couldn't {'star' if star else 'unstar'}: {e}", severity="warning")
+            if self._is_network_error(e):
+                self.mutations.star(item_id, kind, star)
+                self._note_queued()
+            else:
+                self.notify(f"couldn't {'star' if star else 'unstar'}: {e}", severity="warning")
         finally:
             self._mutations -= 1
 
@@ -1322,13 +1375,21 @@ class NaviTuiApp(KitApp):
             else "online mode",
             timeout=3,
         )
+        if not self._offline:
+            self._flush_mutations()  # back online: replay what we buffered
 
     @work(group="mutate")
     async def _scrobble(self, song_id: str, submission: bool) -> None:
+        # best-effort but still worth buffering so play counts catch up; stays
+        # silent (background write, no user gesture to acknowledge)
+        if self._offline:
+            self.mutations.scrobble(song_id, submission)
+            return
         try:
             await self.client.scrobble(song_id, submission)
-        except Exception:
-            pass  # scrobbling is best-effort
+        except Exception as e:
+            if self._is_network_error(e):
+                self.mutations.scrobble(song_id, submission)
 
     # ── art ───────────────────────────────────────────────────────────
     @work(exclusive=True, group="art")
@@ -1422,6 +1483,9 @@ class NaviTuiApp(KitApp):
         self._load_playlists()
         if not self.view.startswith(("artist:", "album:")):
             self._load_view(self.view)
+        # if we're reachable enough to auto-refresh, try draining the queue too;
+        # the flush worker no-ops when offline or empty and re-parks on failure
+        self._flush_mutations()
 
     def action_help(self) -> None:
         self.push_screen(HelpModal(HELP_SECTIONS, title="NaviTui · keys"))
