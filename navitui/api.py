@@ -127,6 +127,13 @@ class SubsonicClient:
         body = await self._get("getAlbum", id=album_id)
         return [Song.from_api(s) for s in body.get("album", {}).get("song", [])]
 
+    async def get_song(self, song_id: str) -> Song | None:
+        """Resolve a single track by id (getSong) — for enqueue-by-id where the
+        song isn't already on screen (search matches names, not ids)."""
+        body = await self._get("getSong", id=song_id)
+        data = body.get("song")
+        return Song.from_api(data) if data else None
+
     async def get_album_list(self, list_type: str, size: int = 500, offset: int = 0) -> list[Album]:
         """list_type: newest | recent | frequent | random | starred | alphabeticalByName"""
         body = await self._get("getAlbumList2", type=list_type, size=size, offset=offset)

@@ -293,6 +293,12 @@ class FakeClient:
     async def get_all_songs(self, max_songs=5000):
         return [s for songs in self.songs.values() for s in songs][:max_songs]
 
+    async def get_song(self, song_id):
+        return next(
+            (s for songs in self.songs.values() for s in songs if s.id == song_id),
+            None,
+        )
+
     async def get_songs_by_albums(self, list_type, albums=15):
         album_list = await self.get_album_list(list_type)
         out = []

@@ -678,9 +678,8 @@ class NaviTuiApp(KitApp):
         song = next((s for s in self._songs if s.id == song_id), None)
         if song is None:
             song = next((s for s in self.queue.songs if s.id == song_id), None)
-        if song is None:  # not on screen: re-fetch via search
-            res = await self.client.search(song_id, 20)
-            song = next((s for s in res.songs if s.id == song_id), None)
+        if song is None:  # not on screen: resolve the id directly (getSong —
+            song = await self.client.get_song(song_id)  # search matches names)
         if song is None:
             return {"queued": False}
         if a.get("next"):
