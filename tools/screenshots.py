@@ -349,16 +349,24 @@ class FakeClient:
     async def set_rating(self, song_id, rating):
         pass
 
+    # demo lyrics — original filler, never real/copyrighted words, so the
+    # karaoke view has something to scroll in screenshots and headless tests
+    _DEMO_LYRICS = [
+        (0.0, "neon rain on the overpass"),
+        (3.4, "static humming in the glass"),
+        (6.8, "we drove where the signal ends"),
+        (10.2, "chrome and midnight, old friends"),
+        (13.6, "the city keeps its low refrain"),
+        (17.0, "every window a different rain"),
+        (20.4, "and the radio starts to fade"),
+        (23.8, "into the quiet that we made"),
+    ]
+
     async def get_lyrics(self, artist, title):
-        return "La la la\nDemo lyrics, verse two\nLa la la"
+        return "\n".join(line for _, line in self._DEMO_LYRICS)
 
     async def get_synced_lyrics(self, song_id):
-        return [
-            (0.0, "La la la"),
-            (2.5, "Demo lyrics, verse two"),
-            (5.0, "the highlight rides the beat"),
-            (7.5, "La la la"),
-        ]
+        return list(self._DEMO_LYRICS)
 
     async def create_share(self, item_id):
         return f"https://demo.music.example/share/{item_id}"
