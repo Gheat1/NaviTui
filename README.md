@@ -67,7 +67,11 @@ exist — they live inside search, where you go looking for them on purpose.
   8fps heartbeat that repaints only a handful of cells, so it stays cheap.
 
 Cross-platform: playback works on **Linux, macOS, and Windows** (anywhere
-`libmpv` runs). Desktop media-key integration is via **MPRIS2** on Linux today.
+`libmpv` runs). Native now-playing rides the OS integration on each — **MPRIS2**
+on Linux, **MPNowPlayingInfoCenter / Control Center** on macOS, and the **System
+Media Transport Controls** on Windows — so track, art, and progress show up
+wherever your OS puts them. (Metadata display is solid across all three;
+media-*key* delivery on macOS/Windows is new and still wants on-target testing.)
 
 ---
 
@@ -136,7 +140,9 @@ Cross-platform: playback works on **Linux, macOS, and Windows** (anywhere
   this-week counts, an activity sparkline, streaks.
 
 ### Part of your desktop
-- Media keys & waybar / playerctl via **MPRIS2**.
+- Native now-playing on every platform: **MPRIS2** (Linux — media keys, waybar,
+  playerctl), **Control Center / lock screen** (macOS), **System Media Transport
+  Controls** (Windows). Install `navitui[macos]` or `navitui[windows]` for those.
 - **Desktop notifications** on track change (cover as the icon) with **prev /
   play-pause / next** action buttons.
 - Optional **Discord rich presence** with a live progress bar.
@@ -209,7 +215,9 @@ pip install "navitui[integrations] @ git+https://github.com/Gheat1/NaviTui"
 
 | extra | pulls in | for |
 | --- | --- | --- |
-| `integrations` | `dbus-fast`, `pypresence` | MPRIS2 media keys, Discord presence |
+| `integrations` | `dbus-fast`, `pypresence` | MPRIS2 media keys (Linux), Discord presence |
+| `macos` | `pyobjc-framework-MediaPlayer`, `pyobjc-framework-Cocoa` | Control Center now-playing (macOS) |
+| `windows` | `winrt-runtime`, `winrt-Windows.*` | System Media Transport Controls (Windows) |
 | `mcp` | `mcp` | the `navitui-mcp` agent server |
 
 Combine them: `navitui[integrations,mcp]`. Drop the extras entirely for the bare
@@ -429,9 +437,13 @@ NAVITUI_ART=off       # a tasteful placeholder, no image
 kitty, WezTerm, Ghostty, and Konsole all render real images; inside tmux you may
 need `NAVITUI_ART=tgp`.
 
-**Media keys do nothing.** They ride on MPRIS2 (Linux). Make sure you installed
-the `integrations` extra (`dbus-fast`) and that you're on a session bus.
-`playerctl status` should report NaviTui while it's playing.
+**Media keys do nothing.** On Linux they ride on MPRIS2 — install the
+`integrations` extra (`dbus-fast`) and be on a session bus; `playerctl status`
+should report NaviTui while it's playing. On macOS install `navitui[macos]`
+(now-playing appears in Control Center); on Windows install `navitui[windows]`
+(the SMTC overlay). Metadata shows reliably on all three — if the hardware media
+*keys* still don't reach NaviTui on macOS/Windows, that path is new and being
+hardened, so file an issue with your terminal and OS version.
 
 **Nothing loads / it says it's offline.** NaviTui shows your last cached library
 when it can't reach the server, so you can still play downloaded tracks. Check
