@@ -46,7 +46,10 @@ navitui/widgets.py    Logo, Visualizer, NowPlaying (the animated transport)
 navitui/art.py        CoverArt widget, protocol picking, NAVITUI_ART override
 navitui/screens.py    onboarding, search modal, InputModal, LyricsModal
 navitui/config.py     player.toml: keybinds, replaygain, gapless, integrations
-navitui/mpris.py      MPRIS2 via dbus-fast (asyncio-native, two-way controls)
+navitui/nowplaying.py OS media façade: picks a backend by platform, wraps controls thread-safe
+navitui/mpris.py      linux backend — MPRIS2 via dbus-fast (asyncio-native, two-way controls)
+navitui/macos_media.py   macos backend — MPNowPlayingInfoCenter/MPRemoteCommandCenter (pyobjc)
+navitui/windows_media.py windows backend — System Media Transport Controls (winrt)
 navitui/integrations.py  desktop notifications + optional discord presence
 navitui/models.py     dataclasses that round-trip through the JSON cache
 tools/screenshots.py  headless SVG screenshot generator + FakeClient
@@ -62,6 +65,7 @@ tools/shots.sh        captures those states with grim → assets/shot-*.png
 | mpv callbacks | arrive on mpv's thread and must never block: `call_from_thread` deadlocks against `terminate()` on quit (UI joins the event thread while the event thread waits for the UI). Use `loop.call_soon_threadsafe`, throttle `time-pos` to ~0.25s steps, silence observers with `_closing` before `terminate()` |
 | textual action args | are Python literals: `enqueue(True)`, never `enqueue(true)` |
 | two `run_test` sessions in one process | can wedge with a constantly-animating app — `tools/screenshots.py` isolates each phase in a subprocess |
+| OS media backends (mac/win) | metadata *display* is solid; receiving media-key presses into a terminal process needs a native run-loop/message-pump thread and is UNVERIFIED on Linux dev boxes — must be tested on a real Mac/Windows machine. All backends are import-safe and no-op off their platform; `nowplaying.create_nowplaying()` dispatches, and `_thread_safe` marshals their callbacks onto the app loop. |
 
 ## testing
 
