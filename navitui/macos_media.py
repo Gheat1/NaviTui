@@ -16,19 +16,20 @@ Two halves, with very different confidence levels:
   pushes are unnecessary; `set_position()` only re-pushes when reality has
   drifted from that extrapolation (i.e. after a seek).
 
-* CONTROLS (needs a real Mac to verify): receiving media-key / Control
-  Center commands back through ``MPRemoteCommandCenter.sharedCommandCenter()``.
-  Command handlers are ordinary Python callables passed to
-  ``addTargetWithHandler_`` (PyObjC bridges them to ObjC blocks). Delivery,
-  however, depends on the process being registered with the media-remote
-  daemon and on *some* Cocoa run loop being pumped — and NaviTui is a bare
-  terminal process running a Textual asyncio loop, not a .app bundle. We do
-  the two things known to help: set the shared NSApplication's activation
-  policy to "accessory", and pump an NSRunLoop on a dedicated daemon thread
-  (commands are registered from that same thread). This works for comparable
-  CLI players, but if macOS insists on delivering to the *main* run loop —
-  which Textual never pumps — the display half still works and the command
-  half silently does nothing.
+* CONTROLS: receiving media-key / Control Center commands back through
+  ``MPRemoteCommandCenter.sharedCommandCenter()``. Command handlers are
+  ordinary Python callables passed to ``addTargetWithHandler_`` (PyObjC bridges
+  them to ObjC blocks). macOS delivers those blocks to the process's *main*
+  dispatch queue, which is serviced only by the *main thread's* run loop — so
+  everything here is done on the main thread: `start()` runs on the app's
+  asyncio loop (which lives on the main thread), registers the commands and
+  sets the shared NSApplication's activation policy to "accessory", then spins
+  up an asyncio task (`_pump`) that runs the main run loop for a zero-length
+  slice every few tens of milliseconds. That drains the main queue so the
+  handlers actually fire — without a dedicated Cocoa thread the media-remote
+  daemon tended to ignore (an earlier design registered and pumped on a
+  background thread, so commands were never delivered and the app frequently
+  didn't even register as the "now playing" client).
 
 Fully optional: without PyObjC (or off macOS entirely) the module still
 imports and `start()` returns False, making every method a no-op.
@@ -39,7 +40,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -106,9 +106,11 @@ if MACOS_MEDIA_AVAILABLE:
 # extrapolating before set_position() bothers to re-push the info dict.
 _DRIFT_TOLERANCE = 2.0
 
-# Seconds the run-loop thread sleeps between pumps when the loop reports no
-# attached input sources (runMode:beforeDate: returns immediately then).
-_IDLE_NAP = 0.25
+# How often (seconds) the asyncio loop pumps the main run loop to drain the
+# main dispatch queue where MPRemoteCommandCenter delivers its command blocks.
+# This bounds media-key latency; small enough to feel instant, large enough to
+# cost nothing.
+_PUMP_INTERVAL = 0.05
 
 
 class MacNowPlaying:
@@ -118,11 +120,12 @@ class MacNowPlaying:
     def __init__(self) -> None:
         self._active = False
         self._controls: dict[str, Callable[..., None]] = {}
-        self._thread: threading.Thread | None = None
-        self._stop_evt = threading.Event()
+        # asyncio task that pumps the main run loop (see _pump).
+        self._pump_task: "asyncio.Task[None] | None" = None
         # (command, target-token) pairs so stop() can removeTarget_ cleanly.
+        # Registration, pumping and teardown all run on the main thread now, so
+        # no lock is needed to guard this.
         self._targets: list[tuple[Any, Any]] = []
-        self._targets_lock = threading.Lock()
         # Cached nowPlayingInfo (a plain Python dict — PyObjC bridges it on
         # every setNowPlayingInfo_ call) plus what we last told macOS, so
         # set_position() can detect drift without any native calls.
@@ -137,7 +140,16 @@ class MacNowPlaying:
 
     # ── lifecycle ──────────────────────────────────────────────────────
     async def start(self, controls: dict) -> bool:
-        """Spin up the run-loop thread and register remote commands.
+        """Register remote commands on the main thread and start pumping the
+        main run loop from the asyncio loop.
+
+        This runs on the app's asyncio loop, which lives on the *main* thread —
+        and that matters: macOS delivers MPRemoteCommandCenter handler blocks to
+        the main dispatch queue, which only the main thread's run loop drains.
+        The earlier design registered and pumped on a background thread, so the
+        commands were never delivered (and the process often wasn't accepted as
+        the "now playing" app at all). Doing it here, on the main thread, is the
+        supported path.
 
         Returns True when the native side came up, False to no-op (missing
         PyObjC, not macOS, or command registration blew up).
@@ -145,31 +157,30 @@ class MacNowPlaying:
         if not MACOS_MEDIA_AVAILABLE or sys.platform != "darwin":
             return False
         self._controls = controls
-        ready = threading.Event()
-        outcome: dict[str, bool] = {"ok": False}
-        self._stop_evt.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop_main,
-            args=(ready, outcome),
-            name="navitui-macos-media",
-            daemon=True,
-        )
-        self._thread.start()
-        # Wait for registration without blocking the asyncio loop.
         try:
-            await asyncio.get_running_loop().run_in_executor(None, ready.wait, 5.0)
+            # Register with the window server as a UI-less accessory app;
+            # without *some* activation policy the media-remote daemon may
+            # never consider this bare terminal process a "now playing" app.
+            # Must happen on the main thread — which is where we are.
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory
+            )
+            self._register_commands()
         except Exception:
-            pass
-        if not outcome["ok"]:
-            self.stop()
+            log.debug("macos_media: command registration failed", exc_info=True)
+            self._unregister_commands()
             return False
         self._active = True
+        self._pump_task = asyncio.ensure_future(self._pump())
         return True
 
     def stop(self) -> None:
-        """Tear down: clear now-playing info, drop command targets, stop the
-        run-loop thread. Idempotent and exception-proof."""
+        """Tear down: stop pumping, clear now-playing info, drop command
+        targets. Idempotent and exception-proof."""
         self._active = False
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            self._pump_task = None
         self._info = None
         try:
             if MACOS_MEDIA_AVAILABLE:
@@ -178,51 +189,31 @@ class MacNowPlaying:
                 center.setPlaybackState_(_STATE_STOPPED)
         except Exception:
             log.debug("macos_media: clearing now-playing info failed", exc_info=True)
-        self._stop_evt.set()
-        thread, self._thread = self._thread, None
-        if thread is not None and thread.is_alive():
-            try:
-                thread.join(timeout=2.0)
-            except Exception:
-                pass
-        # Normally the thread unregisters on its way out; if it wedged past
-        # the join timeout, do it from here — _unregister is idempotent.
         self._unregister_commands()
 
-    # ── run-loop thread ────────────────────────────────────────────────
-    def _run_loop_main(self, ready: threading.Event, outcome: dict) -> None:
-        """Body of the dedicated Cocoa thread: register the remote commands,
-        then pump an NSRunLoop until stop() flags us down."""
-        try:
-            # Register with the window server as a UI-less accessory app;
-            # without *some* activation policy the media-remote daemon may
-            # never consider this bare terminal process a "now playing" app.
-            NSApplication.sharedApplication().setActivationPolicy_(
-                NSApplicationActivationPolicyAccessory
-            )
-            self._register_commands()
-            outcome["ok"] = True
-        except Exception:
-            log.debug("macos_media: command registration failed", exc_info=True)
-        finally:
-            ready.set()
-        if not outcome["ok"]:
-            return
+    # ── main run-loop pump ─────────────────────────────────────────────
+    async def _pump(self) -> None:
+        """Cooperatively drain the main run loop from the asyncio loop.
+
+        MPRemoteCommandCenter blocks are dispatched to the main queue; running
+        the main run loop for a zero-length slice services them (and any pending
+        Cocoa sources) and returns immediately, so this never blocks the app.
+        Runs on the main thread because that is where the asyncio loop lives."""
         run_loop = NSRunLoop.currentRunLoop()
-        while not self._stop_evt.is_set():
-            try:
-                # Pump for up to one slice; returns False immediately when no
-                # input sources are attached, so nap instead of busy-spinning.
-                pumped = run_loop.runMode_beforeDate_(
-                    NSDefaultRunLoopMode,
-                    NSDate.dateWithTimeIntervalSinceNow_(_IDLE_NAP),
-                )
-                if not pumped:
-                    self._stop_evt.wait(_IDLE_NAP)
-            except Exception:
-                log.debug("macos_media: run loop pump failed", exc_info=True)
-                self._stop_evt.wait(_IDLE_NAP)
-        self._unregister_commands()
+        try:
+            while self._active:
+                try:
+                    run_loop.runMode_beforeDate_(
+                        NSDefaultRunLoopMode,
+                        NSDate.dateWithTimeIntervalSinceNow_(0),
+                    )
+                except Exception:
+                    log.debug("macos_media: run loop pump failed", exc_info=True)
+                await asyncio.sleep(_PUMP_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._unregister_commands()
 
     def _register_commands(self) -> None:
         """Enable transport commands and point them at the app callbacks.
@@ -241,16 +232,14 @@ class MacNowPlaying:
             cmd.setEnabled_(True)
             cmd.removeTarget_(None)
             token = cmd.addTargetWithHandler_(self._make_handler(name))
-            with self._targets_lock:
-                self._targets.append((cmd, token))
+            self._targets.append((cmd, token))
 
         # Control Center scrubber → absolute seek.
         pos_cmd = center.changePlaybackPositionCommand()
         pos_cmd.setEnabled_(True)
         pos_cmd.removeTarget_(None)
         token = pos_cmd.addTargetWithHandler_(self._handle_change_position)
-        with self._targets_lock:
-            self._targets.append((pos_cmd, token))
+        self._targets.append((pos_cmd, token))
 
         # Explicitly disabled: enabling skip/seek variants makes the
         # Control Center UI trade its prev/next buttons for skip buttons,
@@ -270,9 +259,8 @@ class MacNowPlaying:
 
     def _unregister_commands(self) -> None:
         """Detach every handler we added and disable the commands. Safe to
-        call twice and from any thread."""
-        with self._targets_lock:
-            targets, self._targets = self._targets, []
+        call twice."""
+        targets, self._targets = self._targets, []
         for cmd, token in targets:
             try:
                 cmd.removeTarget_(token)

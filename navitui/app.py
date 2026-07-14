@@ -1017,7 +1017,7 @@ class NaviTuiApp(KitApp):
         if cached:
             self._stations = [Song.from_dict(s) for s in cached.get("stations", [])]
 
-    @work(exclusive=True, group="lib")
+    @work(exclusive=True, group="lib-podcasts")
     async def _load_podcasts_radio(self) -> None:
         """Refresh podcast channels+episodes and radio stations off the network.
         Each half degrades on its own: a server without podcasts (or radio)
