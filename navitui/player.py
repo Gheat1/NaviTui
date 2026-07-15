@@ -31,6 +31,12 @@ INSTALL_HINTS = (
     "  windows: place libmpv-2.dll on PATH (mpv.io/installation)"
 )
 
+# How far short of the known duration an EOF must land to be treated as a
+# truncated source (worth one resume) rather than a real track end. Wide enough
+# to clear normal end-of-file jitter and encoder padding, tight enough that a
+# stream cut a few seconds early is still caught.
+_EOF_SHORT_TOLERANCE = 5.0
+
 
 class Player:
     """One mpv instance for the life of the app.
@@ -56,6 +62,8 @@ class Player:
         self._closing = False
         self._last_forwarded = -1.0
         self._level = 0.0  # live audio loudness, ~0..1 (written from mpv's thread)
+        self._url: str | None = None  # last source, for a premature-EOF resume
+        self._retried = False  # one resume attempt is armed per play()
 
         opts: dict = dict(
             video=False,
@@ -123,6 +131,19 @@ class Player:
             if not self._want_playing or self._closing:
                 return  # we stopped/replaced it ourselves
             if reason == _mpv.MpvEventEndFile.EOF:
+                # A dropped/truncated source (e.g. a network stream cut short by
+                # a flaky link) surfaces as a *clean* EOF, indistinguishable
+                # from a real finish — so the track "skips" with seconds still
+                # on the clock. If we ended well short of the known length, try
+                # to resume from here once before giving up and advancing.
+                short = (
+                    self.duration > 0.0
+                    and self.position < self.duration - _EOF_SHORT_TOLERANCE
+                )
+                if short and not self._retried and self._url is not None:
+                    self._retried = True
+                    self._reload(self._url, max(0.0, self.position - 1.0))
+                    return
                 self._want_playing = False
                 self._on_track_end(False)
             elif reason == _mpv.MpvEventEndFile.ERROR:
@@ -131,6 +152,15 @@ class Player:
 
     # ── transport ─────────────────────────────────────────────────────
     def play(self, url: str, start: float = 0.0) -> None:
+        # public entry: a genuine new track, so arm one resume attempt for it
+        self._url = url
+        self._retried = False
+        self._reload(url, start)
+
+    def _reload(self, url: str, start: float = 0.0) -> None:
+        # (re)open `url` at `start`. Shared by play() and the premature-EOF
+        # resume, which must NOT reset _retried (that would loop forever on a
+        # source that always ends short).
         self._want_playing = False  # swallow the end-file of whatever was on
         self.position = start
         self.duration = 0.0
