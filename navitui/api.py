@@ -454,9 +454,11 @@ class SubsonicClient:
     # Original files are pinned by id under the audio cache dir. We keep the
     # id opaque (no suffix in the name): the server may transcode or the
     # suffix may be unknown offline, and mpv probes the container regardless.
-    # `download_song` mirrors `cover_art` exactly — atomic .part→rename with
-    # the JSON-error content-type guard — so a killed download never leaves a
-    # half file that reads as "downloaded".
+    # `download_song` mirrors `cover_art` — atomic .part→rename with the
+    # JSON-error content-type guard, so a killed download never leaves a half
+    # file that reads as "downloaded". _fetch_audio additionally rejects a body
+    # short of its Content-Length, so a mid-transfer drop can't pin a truncated
+    # file either (a truncated pin plays short and skips near the end).
     def _audio_path(self, song_id: str) -> Path:
         return self._audio_dir / song_id.replace("/", "_")
 
@@ -496,6 +498,20 @@ class SubsonicClient:
             return None
         if resp.headers.get("content-type", "").startswith("application/json"):
             return None
+        # Reject a short body: a link that drops mid-transfer can close cleanly,
+        # and httpx accepts the truncated bytes as a valid (connection-close)
+        # end-of-body. Pinning that leaves a file mpv plays ~seconds short of the
+        # header-declared length, so playback "skips" near the end. Only checked
+        # when the length is known and the transfer wasn't content-encoded (audio
+        # isn't, so Content-Length == decoded byte count).
+        expected = resp.headers.get("content-length")
+        encoded = resp.headers.get("content-encoding", "").lower() not in ("", "identity")
+        if expected is not None and not encoded:
+            try:
+                if len(resp.content) != int(expected):
+                    return None
+            except ValueError:
+                pass
         return resp
 
     def remove_pin(self, song_id: str) -> bool:
