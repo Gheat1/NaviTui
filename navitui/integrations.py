@@ -266,6 +266,10 @@ class DiscordPresence:
                 self._rpc.clear()
                 return
             fields: dict = {
+                # activity_type 2 = "Listening to", so Discord reads
+                # "Listening to <title>" rather than the default "Playing".
+                # pypresence >= 4.3 (our pin) accepts this on update().
+                "activity_type": 2,
                 "details": song.title,
                 "state": f"{song.artist}{' · paused' if not playing else ''}",
                 "large_text": song.album or "NaviTui",

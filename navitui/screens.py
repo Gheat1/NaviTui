@@ -217,6 +217,15 @@ class LyricsModal(ModalScreen):
         Binding("escape", "close_modal", show=False),
         Binding("q", "close_modal", show=False),
         Binding("L", "close_modal", show=False),
+        # route the main transport keys through the overlay so you can drive
+        # playback while reading lyrics
+        Binding("space", "app_play_pause", show=False),
+        Binding("n", "app_next", show=False),
+        Binding("b", "app_prev", show=False),
+        Binding("left", "app_seek(-5)", show=False),
+        Binding("right", "app_seek(5)", show=False),
+        Binding("shift+left", "app_seek(-30)", show=False),
+        Binding("shift+right", "app_seek(30)", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -300,6 +309,32 @@ class LyricsModal(ModalScreen):
 
     def action_close_modal(self) -> None:
         self.dismiss(None)
+
+    # forward the transport keys to the app so playback works while lyrics are
+    # open; each is a thin, defensive shim (the app owns the real logic)
+    def action_app_play_pause(self) -> None:
+        try:
+            self.app.action_play_pause()
+        except Exception:
+            pass
+
+    def action_app_next(self) -> None:
+        try:
+            self.app.action_next_track()
+        except Exception:
+            pass
+
+    def action_app_prev(self) -> None:
+        try:
+            self.app.action_prev_track()
+        except Exception:
+            pass
+
+    def action_app_seek(self, seconds: int) -> None:
+        try:
+            self.app.action_seek(seconds)
+        except Exception:
+            pass
 
 
 class StatsModal(ModalScreen):
@@ -559,6 +594,534 @@ class SearchModal(ModalScreen):
             self.dismiss(("album", self._results.albums[i]))
         elif kind == "artist":
             self.dismiss(("artist", self._results.artists[i]))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# 10-band EQ presets (gains in dB, low → high), matching player.Player.EQ_FREQS.
+EQ_PRESETS: dict[str, list[float]] = {
+    "flat":       [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "bass":       [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+    "rock":       [4, 3, 1, -1, -1, 1, 2, 3, 3, 3],
+    "pop":        [-1, 0, 1, 2, 3, 3, 2, 1, 0, -1],
+    "vocal":      [-2, -1, 0, 2, 3, 3, 2, 1, 0, -1],
+    "electronic": [4, 3, 1, 0, -2, 1, 0, 1, 3, 4],
+    "classical":  [3, 2, 1, 0, 0, 0, -1, -1, 0, 2],
+}
+EQ_PRESET_ORDER = ["flat", "bass", "rock", "pop", "vocal", "electronic", "classical"]
+EQ_FREQ_LABELS = ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+EQ_MAX_GAIN = 12.0
+
+
+class EqualizerModal(ModalScreen):
+    """Interactive 10-band equalizer overlay.
+
+    h/l select a band, j/k lower/raise it (±1 dB, ±12 range), space toggles the
+    EQ on/off, p cycles presets, r resets to flat. Live-applies to the player
+    while enabled. Dismisses with {"enabled", "preset", "bands"}.
+    """
+
+    BINDINGS = [
+        Binding("escape", "save_close", show=False),
+        Binding("q", "save_close", show=False),
+        Binding("left", "select(-1)", show=False),
+        Binding("h", "select(-1)", show=False),
+        Binding("right", "select(1)", show=False),
+        Binding("l", "select(1)", show=False),
+        Binding("up", "adjust(1)", show=False),
+        Binding("k", "adjust(1)", show=False),
+        Binding("down", "adjust(-1)", show=False),
+        Binding("j", "adjust(-1)", show=False),
+        Binding("space", "toggle_enabled", show=False),
+        Binding("p", "cycle_preset", show=False),
+        Binding("r", "reset", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    EqualizerModal { align: center middle; background: $kit-overlay; }
+    EqualizerModal #eq-box {
+        width: 60; height: auto;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    EqualizerModal Static { background: $kit-modal-bg; }
+    EqualizerModal #eq-head { height: 1; margin-bottom: 1; }
+    """
+
+    def __init__(self, enabled: bool, preset: str, gains: list[float]) -> None:
+        super().__init__()
+        self._enabled = bool(enabled)
+        self._preset = preset if preset in EQ_PRESETS else "custom"
+        self._gains = [float(g) for g in (list(gains)[:10] + [0.0] * 10)[:10]]
+        self._sel = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="eq-box"):
+            with Horizontal(id="eq-head"):
+                head = Text()
+                head.append(f"{icons.bars(3, palette.blue, palette.vfaint)} ")
+                head.append("equalizer", style=f"bold {palette.sub}")
+                yield Static(head, id="eq-title")
+            yield Static(self._render_eq(), id="eq-body")
+            yield Static(self._hint(), id="eq-hint")
+
+    def _slider(self, gain: float, selected: bool) -> Text:
+        # a vertical-ish gauge drawn horizontally: 0 dB centered, ±12 to the ends
+        width = 21
+        mid = width // 2
+        pos = int(round((gain / EQ_MAX_GAIN) * mid)) + mid
+        pos = max(0, min(width - 1, pos))
+        bar = Text()
+        for i in range(width):
+            if i == pos:
+                bar.append("●", style=palette.blue if selected else palette.sub)
+            elif i == mid:
+                bar.append("┆", style=palette.vfaint)
+            else:
+                bar.append("─", style=palette.vfaint)
+        return bar
+
+    def _render_eq(self) -> Text:
+        # (named _render_eq, not _render — Widget._render is a real internal)
+        out = Text()
+        state = "on" if self._enabled else "off"
+        state_style = palette.green if self._enabled else palette.faint
+        out.append("  state ", style=palette.dim)
+        out.append(f"{state}", style=f"bold {state_style}")
+        out.append("   preset ", style=palette.dim)
+        out.append(f"{self._preset}\n\n", style=palette.mauve)
+        for i, gain in enumerate(self._gains):
+            selected = i == self._sel
+            marker = "▶" if selected else " "
+            label_style = f"bold {palette.text}" if selected else palette.dim
+            out.append(f" {marker} ", style=palette.blue if selected else palette.vfaint)
+            out.append(f"{EQ_FREQ_LABELS[i]:>4} ", style=label_style)
+            out.append_text(self._slider(gain, selected))
+            out.append(f" {gain:+.0f}\n", style=label_style)
+        return out
+
+    def _hint(self) -> Text:
+        t = Text("\n")
+        pairs = [
+            ("h/l", "band"), ("j/k", "gain"), ("space", "on/off"),
+            ("p", "preset"), ("r", "reset"), ("esc", "save"),
+        ]
+        for i, (key, desc) in enumerate(pairs):
+            if i:
+                t.append("  ·  ", style=palette.vfaint)
+            t.append(key, style=palette.blue)
+            t.append(f" {desc}", style=palette.dim)
+        return t
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#eq-box"))
+        settle_pop_in(self, "#eq-box")
+
+    def _refresh(self) -> None:
+        try:
+            self.query_one("#eq-body", Static).update(self._render_eq())
+        except Exception:
+            pass
+
+    def _apply_live(self) -> None:
+        # reflect edits in real time only when the EQ is enabled
+        player = getattr(self.app, "player", None)
+        if player is not None and self._enabled:
+            try:
+                player.set_equalizer(self._gains)
+            except Exception:
+                pass
+
+    def action_select(self, delta: int) -> None:
+        self._sel = (self._sel + delta) % 10
+        self._refresh()
+
+    def action_adjust(self, delta: int) -> None:
+        g = max(-EQ_MAX_GAIN, min(EQ_MAX_GAIN, self._gains[self._sel] + delta))
+        self._gains[self._sel] = g
+        self._preset = "custom"
+        self._refresh()
+        self._apply_live()
+
+    def action_toggle_enabled(self) -> None:
+        self._enabled = not self._enabled
+        self._refresh()
+        player = getattr(self.app, "player", None)
+        if player is not None:
+            try:
+                player.set_equalizer(self._gains if self._enabled else [])
+            except Exception:
+                pass
+
+    def action_cycle_preset(self) -> None:
+        # step to the next named preset and load its gains
+        if self._preset in EQ_PRESET_ORDER:
+            idx = (EQ_PRESET_ORDER.index(self._preset) + 1) % len(EQ_PRESET_ORDER)
+        else:
+            idx = 0
+        self._preset = EQ_PRESET_ORDER[idx]
+        self._gains = list(EQ_PRESETS[self._preset])
+        self._refresh()
+        self._apply_live()
+
+    def action_reset(self) -> None:
+        self._preset = "flat"
+        self._gains = list(EQ_PRESETS["flat"])
+        self._refresh()
+        self._apply_live()
+
+    def action_save_close(self) -> None:
+        self.dismiss({"enabled": self._enabled, "preset": self._preset, "bands": self._gains})
+
+
+class AudioDeviceSwitcherModal(ModalScreen):
+    """Pick the audio output device. Dismisses with the mpv device name, or
+    None on escape. `devices` are mpv device dicts; `active` is the current
+    device name (marked with a dot)."""
+
+    BINDINGS = [Binding("escape", "cancel", show=False), Binding("q", "cancel", show=False)]
+
+    DEFAULT_CSS = """
+    AudioDeviceSwitcherModal { align: center middle; background: $kit-overlay; }
+    AudioDeviceSwitcherModal #dev-box {
+        width: 60; height: auto; max-height: 80%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    AudioDeviceSwitcherModal Static { background: $kit-modal-bg; }
+    AudioDeviceSwitcherModal #dev-list { height: auto; max-height: 20; }
+    """
+
+    def __init__(self, devices: list[dict], active: str) -> None:
+        super().__init__()
+        self._devices = devices
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dev-box"):
+            head = Text()
+            head.append(f"{icons.SPEAKER if hasattr(icons, 'SPEAKER') else '♪'} ", style=palette.blue)
+            head.append("audio output", style=f"bold {palette.sub}")
+            yield Static(head)
+            yield NavList(id="dev-list")
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#dev-box"))
+        settle_pop_in(self, "#dev-box")
+        ol = self.query_one("#dev-list", NavList)
+        opts: list[Option] = []
+        if not self._devices:
+            opts.append(Option(Text("  no devices reported", style=palette.dim), disabled=True))
+        for i, dev in enumerate(self._devices):
+            name = dev.get("name", "")
+            desc = dev.get("description", "") or name
+            row = Text("  ", no_wrap=True, overflow="ellipsis")
+            active = name == self._active
+            row.append("● " if active else "  ", style=palette.green if active else palette.vfaint)
+            row.append(desc, style=palette.text if active else palette.sub)
+            opts.append(Option(row, id=f"dev:{i}"))
+        ol.add_options(opts)
+        first = next((i for i, o in enumerate(opts) if not o.disabled), None)
+        if first is not None:
+            ol.highlighted = first
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#dev-list")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        oid = event.option.id
+        if oid and oid.startswith("dev:"):
+            self.dismiss(self._devices[int(oid.split(":", 1)[1])].get("name", ""))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ServerSwitcherModal(ModalScreen):
+    """Pick a saved Navidrome profile. Dismisses with the profile name, or None
+    on escape. `names` is the list of profile names; `active` is the current."""
+
+    BINDINGS = [Binding("escape", "cancel", show=False), Binding("q", "cancel", show=False)]
+
+    DEFAULT_CSS = """
+    ServerSwitcherModal { align: center middle; background: $kit-overlay; }
+    ServerSwitcherModal #srv-box {
+        width: 54; height: auto; max-height: 80%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    ServerSwitcherModal Static { background: $kit-modal-bg; }
+    ServerSwitcherModal #srv-list { height: auto; max-height: 18; }
+    """
+
+    def __init__(self, names: list[str], active: str) -> None:
+        super().__init__()
+        self._names = names
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="srv-box"):
+            head = Text()
+            head.append(f"{icons.USER} ", style=palette.peach)
+            head.append("switch server", style=f"bold {palette.sub}")
+            yield Static(head)
+            yield NavList(id="srv-list")
+            yield Static(self._hint(), id="srv-hint")
+
+    def _hint(self) -> Text:
+        t = Text("\n")
+        t.append("profiles live in ", style=palette.vfaint)
+        t.append("[profiles.<name>]", style=palette.dim)
+        t.append(" in your config", style=palette.vfaint)
+        return t
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#srv-box"))
+        settle_pop_in(self, "#srv-box")
+        ol = self.query_one("#srv-list", NavList)
+        opts: list[Option] = []
+        if not self._names:
+            opts.append(Option(Text("  no profiles configured", style=palette.dim), disabled=True))
+        for i, name in enumerate(self._names):
+            row = Text("  ", no_wrap=True, overflow="ellipsis")
+            active = name == self._active
+            row.append("● " if active else "  ", style=palette.green if active else palette.vfaint)
+            row.append(name, style=palette.text if active else palette.sub)
+            opts.append(Option(row, id=f"srv:{i}"))
+        ol.add_options(opts)
+        first = next((i for i, o in enumerate(opts) if not o.disabled), None)
+        if first is not None:
+            ol.highlighted = first
+        ol.focus()
+
+    @on(OptionList.OptionSelected, "#srv-list")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        oid = event.option.id
+        if oid and oid.startswith("srv:"):
+            self.dismiss(self._names[int(oid.split(":", 1)[1])])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PlaylistPickerModal(ModalScreen):
+    """Add one track to one or more playlists. space toggles the highlighted
+    playlist, ctrl+s confirms. Dismisses with {"action": "add", "playlist_ids":
+    [...]} or {"action": "new"} (create a new playlist), or None on escape.
+
+    `playlists` is a list of (id, name).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", show=False),
+        Binding("q", "cancel", show=False),
+        Binding("space", "toggle", show=False),
+        Binding("ctrl+s", "confirm", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PlaylistPickerModal { align: center middle; background: $kit-overlay; }
+    PlaylistPickerModal #plp-box {
+        width: 56; height: auto; max-height: 80%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    PlaylistPickerModal Static { background: $kit-modal-bg; }
+    PlaylistPickerModal #plp-list { height: auto; max-height: 20; }
+    """
+
+    def __init__(self, playlists: list[tuple[str, str]], title: str = "add to playlists") -> None:
+        super().__init__()
+        self._playlists = playlists
+        self._title = title
+        self._checked: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="plp-box"):
+            yield Static(Text(self._title, style=f"bold {palette.sub}"))
+            yield NavList(id="plp-list")
+            yield Static(self._hint(), id="plp-hint")
+
+    def _hint(self) -> Text:
+        t = Text("\n")
+        for i, (key, desc) in enumerate(
+            [("space", "toggle"), ("ctrl+s", "add to selected"), ("enter", "new / add"), ("esc", "cancel")]
+        ):
+            if i:
+                t.append("  ·  ", style=palette.vfaint)
+            t.append(key, style=palette.blue)
+            t.append(f" {desc}", style=palette.dim)
+        return t
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#plp-box"))
+        settle_pop_in(self, "#plp-box")
+        self._rebuild()
+        ol = self.query_one("#plp-list", NavList)
+        ol.focus()
+
+    def _rebuild(self) -> None:
+        ol = self.query_one("#plp-list", NavList)
+        keep = ol.highlighted
+        ol.clear_options()
+        opts: list[Option] = [Option(Text("  ＋ new playlist…", style=palette.blue), id="new")]
+        for pid, name in self._playlists:
+            box = "[x]" if pid in self._checked else "[ ]"
+            row = Text("  ", no_wrap=True, overflow="ellipsis")
+            row.append(f"{box} ", style=palette.green if pid in self._checked else palette.vfaint)
+            row.append(name, style=palette.text)
+            opts.append(Option(row, id=f"pl:{pid}"))
+        ol.add_options(opts)
+        if keep is not None:
+            ol.highlighted = min(keep, ol.option_count - 1)
+        elif ol.option_count:
+            ol.highlighted = 0
+
+    def _highlighted_id(self) -> str | None:
+        ol = self.query_one("#plp-list", NavList)
+        if ol.highlighted is None:
+            return None
+        return ol.get_option_at_index(ol.highlighted).id
+
+    def action_toggle(self) -> None:
+        oid = self._highlighted_id()
+        if oid and oid.startswith("pl:"):
+            pid = oid.split(":", 1)[1]
+            self._checked.symmetric_difference_update({pid})
+            self._rebuild()
+
+    def action_confirm(self) -> None:
+        if self._checked:
+            self.dismiss({"action": "add", "playlist_ids": list(self._checked)})
+
+    @on(OptionList.OptionSelected, "#plp-list")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        oid = event.option.id
+        if oid == "new":
+            self.dismiss({"action": "new"})
+        elif oid and oid.startswith("pl:"):
+            # enter on a row: if nothing is checked, add just this one
+            if self._checked:
+                self.action_confirm()
+            else:
+                self.dismiss({"action": "add", "playlist_ids": [oid.split(":", 1)[1]]})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SettingsModal(ModalScreen):
+    """Album Spotlight / AI settings: pick a provider (Claude or Gemini), paste
+    an API key, and optionally set a model. Dismisses with the changed values
+    (a dict the app persists to state), or None on escape.
+
+    `current` supplies the effective values to pre-fill.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", show=False),
+        Binding("ctrl+s", "save", show=False),
+        Binding("ctrl+g", "cycle_provider", show=False),
+        Binding("ctrl+h", "toggle_home", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    SettingsModal { align: center middle; background: $kit-overlay; }
+    SettingsModal #set-box {
+        width: 64; height: auto;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    SettingsModal Static { background: $kit-modal-bg; }
+    SettingsModal Input { background: transparent; border: round $kit-border; margin-bottom: 0; }
+    SettingsModal Input:focus { border: round $kit-border-focus; }
+    SettingsModal .set-label { height: 1; }
+    """
+
+    def __init__(self, current: dict) -> None:
+        super().__init__()
+        from navitui import ai as aimod
+
+        self._ai = aimod
+        self._provider = current.get("ai_provider", "anthropic")
+        if self._provider not in aimod.PROVIDERS:
+            self._provider = "anthropic"
+        self._home = bool(current.get("home_spotlight", True))
+        self._anthropic_key = current.get("anthropic_api_key", "")
+        self._gemini_key = current.get("gemini_api_key", "")
+        self._model = current.get("ai_model", "")
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="set-box"):
+            head = Text()
+            head.append("⚙ ", style=palette.mauve)
+            head.append("Album Spotlight — AI settings", style=f"bold {palette.sub}")
+            yield Static(head)
+            yield Static(self._status(), id="set-status")
+            yield Static(Text("Anthropic (Claude) API key", style=palette.dim), classes="set-label")
+            yield Input(value=self._anthropic_key, password=True,
+                        placeholder="sk-ant-…", id="set-anthropic")
+            yield Static(Text("Gemini (Google) API key", style=palette.dim), classes="set-label")
+            yield Input(value=self._gemini_key, password=True,
+                        placeholder="AIza…", id="set-gemini")
+            yield Static(Text("Model (blank = provider default)", style=palette.dim), classes="set-label")
+            yield Input(value=self._model, placeholder=self._ai.default_model(self._provider),
+                        id="set-model")
+            yield Static(self._hint(), id="set-hint")
+
+    def _status(self) -> Text:
+        t = Text()
+        t.append("Provider ", style=palette.dim)
+        t.append(self._ai.provider_label(self._provider), style=f"bold {palette.blue}")
+        t.append("   Home ", style=palette.dim)
+        t.append("on" if self._home else "off",
+                 style=f"bold {palette.green if self._home else palette.faint}")
+        t.append("   default model ", style=palette.dim)
+        t.append(self._ai.default_model(self._provider), style=palette.mauve)
+        return t
+
+    def _hint(self) -> Text:
+        t = Text("\n")
+        for i, (key, desc) in enumerate(
+            [("ctrl+g", "switch provider"), ("ctrl+h", "toggle Home"),
+             ("ctrl+s", "save"), ("esc", "cancel")]
+        ):
+            if i:
+                t.append("  ·  ", style=palette.vfaint)
+            t.append(key, style=palette.blue)
+            t.append(f" {desc}", style=palette.dim)
+        return t
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#set-box"))
+        settle_pop_in(self, "#set-box")
+        self.query_one("#set-anthropic", Input).focus()
+
+    def _refresh_status(self) -> None:
+        try:
+            self.query_one("#set-status", Static).update(self._status())
+            self.query_one("#set-model", Input).placeholder = self._ai.default_model(self._provider)
+        except Exception:
+            pass
+
+    def action_cycle_provider(self) -> None:
+        idx = (self._ai.PROVIDERS.index(self._provider) + 1) % len(self._ai.PROVIDERS)
+        self._provider = self._ai.PROVIDERS[idx]
+        self._refresh_status()
+
+    def action_toggle_home(self) -> None:
+        self._home = not self._home
+        self._refresh_status()
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.action_save()
+
+    def action_save(self) -> None:
+        self.dismiss(
+            {
+                "ai_provider": self._provider,
+                "anthropic_api_key": self.query_one("#set-anthropic", Input).value.strip(),
+                "gemini_api_key": self.query_one("#set-gemini", Input).value.strip(),
+                "ai_model": self.query_one("#set-model", Input).value.strip(),
+                "home_spotlight": self._home,
+            }
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)

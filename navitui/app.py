@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import textwrap
 import time
 
 from rich.text import Text
@@ -39,7 +40,19 @@ from navitui.mutations import MutationQueue
 from navitui.palette import NaviTuiCommands
 from navitui.playqueue import PlayQueue
 from navitui.remote import Remote, build_snapshot
-from navitui.screens import InputModal, LyricsModal, OnboardingScreen, SearchModal, StatsModal
+from navitui.screens import (
+    AudioDeviceSwitcherModal,
+    EqualizerModal,
+    InputModal,
+    LyricsModal,
+    OnboardingScreen,
+    PlaylistPickerModal,
+    SearchModal,
+    ServerSwitcherModal,
+    SettingsModal,
+    StatsModal,
+)
+from navitui import ai as aimod
 from navitui.stats import StatsStore
 from navitui import stats as statsmod
 from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
@@ -247,6 +260,11 @@ class NaviTuiApp(KitApp):
         _kb("theme_cycle", "cycle_kit_theme", "theme", show=True),
         _kb("theme_pick", "change_theme"),
         _kb("zen", "toggle_zen", "zen", show=True),
+        _kb("equalizer", "show_equalizer"),
+        _kb("audio_device", "switch_audio_device"),
+        _kb("server_switch", "switch_server"),
+        _kb("private_mode", "toggle_private_mode"),
+        _kb("settings", "settings"),
         # explicit so it's remappable via player.toml; Textual would otherwise
         # auto-bind ctrl+p. Naming the binding `command_palette` also stops the
         # auto-bind from doubling up.
@@ -389,16 +407,24 @@ class NaviTuiApp(KitApp):
         self.query_one("#tracks-panel").border_title = "tracks"
         self.query_one("#art-panel", CoverArt).border_title = "cover"
         self.query_one("#queue-panel").border_title = "queue"
+        # Album Spotlight Home view — effective home_spotlight (state over config)
+        self._home_enabled = bool(self._setting("home_spotlight"))
         saved_view = state.get("view", "all-songs")
         if (
             saved_view in VIEW_LABELS
             or saved_view.startswith(("pl:", "podcast:"))
             or saved_view == "radio"
+            or (saved_view == "home" and self._home_enabled)
         ):
             self.view = saved_view
+        elif saved_view == "home":
+            self.view = "all-songs"  # Home was turned off since last launch
         # offline mode is session-only: always start online so a stray `O`
         # toggle can't silently strand every future launch offline
         self._offline = False
+        # private listening (no scrobble / no local play-log) — session-only,
+        # same reasoning as offline: never persist it across launches
+        self.private_mode = False
         self._radio = bool(state.get("radio", False))
         # jukebox mode: config default, overridable by the last runtime toggle
         self._jukebox = bool(state.get("jukebox", CONFIG["jukebox"]))
@@ -416,6 +442,7 @@ class NaviTuiApp(KitApp):
         # to it once one exists (keeps mpv the safe default through onboarding)
         self.player = self._make_player(jukebox=False)
         self.player.set_volume(int(state.get("volume", 80)))
+        self._apply_audio_settings()  # restore saved EQ + output device
         now = self.query_one("#now", NowPlaying)
         now.volume = self.player.volume
         now.speed = self.player.set_speed(float(state.get("speed", 1.0)))
@@ -481,6 +508,10 @@ class NaviTuiApp(KitApp):
             ao=self._ao,
             replaygain=str(CONFIG["replaygain"]),
             gapless=str(CONFIG["gapless"]),
+            replaygain_preamp=float(CONFIG["replaygain_preamp"]),
+            replaygain_fallback=float(CONFIG["replaygain_fallback"]),
+            audio_exclusive=bool(CONFIG["audio_exclusive"]),
+            pipewire_buffer=int(CONFIG["pipewire_buffer"]),
         )
 
     def _switch_player(self, jukebox: bool, announce: bool = True) -> None:
@@ -496,6 +527,7 @@ class NaviTuiApp(KitApp):
         self._jukebox = isinstance(self.player, self._jukebox_type())
         self.player.set_volume(volume)
         self.query_one("#now", NowPlaying).volume = self.player.volume
+        self._apply_audio_settings()  # EQ + device follow the new local engine
         if was_active and self.queue.current is not None:
             self._play_current(resume_at=position)
         if announce:
@@ -530,6 +562,311 @@ class NaviTuiApp(KitApp):
         target = not self._jukebox
         self.dirs.save_state({"jukebox": target})
         self._switch_player(jukebox=target)
+
+    # ── settings: effective values (runtime state overlaid on config) ─────
+    def _setting(self, key: str):
+        """Effective value for a settings key: the last runtime value saved in
+        app state, else the config default. Lets the in-app Settings screen and
+        the equalizer overlay persist without touching player.toml."""
+        st = self.dirs.load_state()
+        return st[key] if key in st else CONFIG.get(key)
+
+    def _eq_state(self) -> dict:
+        st = self.dirs.load_state().get("equalizer")
+        eq = dict(CONFIG["equalizer"])
+        if isinstance(st, dict):
+            for k in ("enabled", "preset", "bands"):
+                if k in st:
+                    eq[k] = st[k]
+        return eq
+
+    def _apply_audio_settings(self) -> None:
+        """Push the saved EQ + output device onto the (local) player. No-ops
+        cleanly on the jukebox engine, which has neither."""
+        player = self.player
+        if player is None:
+            return
+        setter = getattr(player, "set_equalizer", None)
+        eq = self._eq_state()
+        if setter is not None and eq.get("enabled"):
+            try:
+                setter(list(eq.get("bands", [])))
+            except Exception:
+                pass
+        saved = self.dirs.load_state().get("audio_device")
+        lister = getattr(player, "get_audio_devices", None)
+        apply = getattr(player, "set_audio_device", None)
+        if saved and lister is not None and apply is not None:
+            try:
+                # smart-match the saved name across driver/bluetooth renames:
+                # match on the distinctive tail (minus a dynamic dotted suffix)
+                target = saved
+                distinctive = saved.split("/", 1)[-1] if "/" in saved else saved
+                base = distinctive.rsplit(".", 1)[0] if "." in distinctive else distinctive
+                for dev in lister():
+                    if base and base in dev.get("name", ""):
+                        target = dev.get("name", "")
+                        break
+                apply(target)
+            except Exception:
+                pass
+
+    # ── equalizer ─────────────────────────────────────────────────────
+    def action_show_equalizer(self) -> None:
+        if getattr(self.player, "set_equalizer", None) is None:
+            self.notify("equalizer needs local playback (mpv)", timeout=3)
+            return
+        eq = self._eq_state()
+        self.push_screen(
+            EqualizerModal(bool(eq.get("enabled")), str(eq.get("preset", "flat")),
+                           list(eq.get("bands", [0.0] * 10))),
+            self._equalizer_saved,
+        )
+
+    def _equalizer_saved(self, result) -> None:
+        if not result:
+            return
+        self.dirs.save_state({"equalizer": result})
+        setter = getattr(self.player, "set_equalizer", None)
+        if setter is not None:
+            try:
+                setter(result["bands"] if result.get("enabled") else [])
+            except Exception:
+                pass
+
+    # ── output device ─────────────────────────────────────────────────
+    def action_switch_audio_device(self) -> None:
+        lister = getattr(self.player, "get_audio_devices", None)
+        if lister is None:
+            self.notify("device switching needs local playback (mpv)", timeout=3)
+            return
+        try:
+            devices = lister()
+        except Exception:
+            devices = []
+        active = ""
+        getter = getattr(self.player, "get_current_audio_device", None)
+        if getter is not None:
+            try:
+                active = getter()
+            except Exception:
+                active = ""
+        self.push_screen(AudioDeviceSwitcherModal(devices, active), self._audio_device_picked)
+
+    def _audio_device_picked(self, name) -> None:
+        if not name:
+            return
+        apply = getattr(self.player, "set_audio_device", None)
+        if apply is not None:
+            try:
+                apply(name)
+            except Exception:
+                pass
+        self.dirs.save_state({"audio_device": name})
+        self.notify(f"output → {name}", timeout=2)
+
+    # ── multi-server switching ────────────────────────────────────────
+    def _profiles(self) -> dict:
+        """Saved Navidrome profiles, keyed by name, from a [profiles.<name>]
+        block in the secrets file: each has server/username/token/salt."""
+        try:
+            profiles = self.dirs.load_config().get("profiles")
+        except Exception:
+            profiles = None
+        return profiles if isinstance(profiles, dict) else {}
+
+    def action_switch_server(self) -> None:
+        profiles = self._profiles()
+        active = self.dirs.load_state().get("active_profile", "")
+        self.push_screen(ServerSwitcherModal(list(profiles.keys()), active), self._server_picked)
+
+    def _server_picked(self, name) -> None:
+        if not name:
+            return
+        creds = self._profiles().get(name)
+        if not isinstance(creds, dict) or not all(
+            creds.get(k) for k in ("server", "username", "token", "salt")
+        ):
+            self.notify("that profile is missing credentials", severity="warning", timeout=4)
+            return
+        self.dirs.save_state({"active_profile": name})
+        self.client = SubsonicClient(
+            creds["server"], creds["username"], creds["token"], creds["salt"],
+            art_dir=self.dirs.cache_dir / "art",
+            audio_dir=self.dirs.cache_dir / "audio",
+            max_bitrate=int(CONFIG["max_bitrate"]),
+            stream_format=str(CONFIG["stream_format"]),
+        )
+        self._playlists = []
+        self._render_status()
+        self._render_sidebar()
+        self._load_playlists()
+        self._load_podcasts_radio()
+        self._load_view(self.view)
+        self.notify(f"switched to {name}", timeout=3)
+
+    # ── private listening ─────────────────────────────────────────────
+    def action_toggle_private_mode(self) -> None:
+        self.private_mode = not self.private_mode
+        self._render_status()
+        self.notify(
+            "private listening on — not scrobbling"
+            if self.private_mode
+            else "private listening off",
+            timeout=3,
+        )
+
+    # ── settings screen (Album Spotlight / AI) ────────────────────────
+    def action_settings(self) -> None:
+        current = {
+            k: self._setting(k)
+            for k in ("ai_provider", "anthropic_api_key", "gemini_api_key",
+                      "ai_model", "home_spotlight")
+        }
+        self.push_screen(SettingsModal(current), self._settings_saved)
+
+    def _settings_saved(self, result) -> None:
+        if not result:
+            return
+        self.dirs.save_state(result)
+        self._home_enabled = bool(result.get("home_spotlight", self._home_enabled))
+        self._render_sidebar()
+        self.notify("settings saved", timeout=2)
+        if self.view == "home":
+            self._load_view("home")  # pick up a newly-added key / provider
+
+    # ── Album Spotlight (Home view) ───────────────────────────────────
+    def _spotlight_configured(self) -> bool:
+        provider = str(self._setting("ai_provider") or "anthropic")
+        return aimod.is_configured(
+            provider,
+            str(self._setting("anthropic_api_key") or ""),
+            str(self._setting("gemini_api_key") or ""),
+        )
+
+    async def _render_home(self) -> None:
+        """Album of the Day + AI trivia. Renders as disabled info rows (not
+        playable track rows) so the track-index handlers stay untouched;
+        self._songs still holds the album so Enter on the Home row plays it."""
+        if self.client is None:
+            return
+        try:
+            albums = await self.client.get_album_list("newest", size=30)
+        except Exception:
+            albums = []
+        album = None
+        if albums:
+            # deterministic "of the day": same album all day, changes at midnight
+            album = random.Random(time.strftime("%Y-%m-%d")).choice(albums)
+        else:
+            cached = self.dirs.read_cache("home-mix") or {}
+            if cached.get("album"):
+                album = Album.from_dict(cached["album"])
+        if album is None:
+            self._show_spotlight(None, [], None, hint="add albums to your library")
+            return
+        try:
+            songs = await self.client.get_album_songs(album.id)
+        except Exception:
+            songs = []
+        if self.view != "home":
+            return
+        self.dirs.write_cache("home-mix", {"album": album.to_dict(), "spotlight_album_id": album.id})
+        cached = self.dirs.read_cache(f"spotlight-{album.id}")
+        meta = cached if isinstance(cached, dict) and cached.get("trivia") else None
+        will_fetch = meta is None and self._spotlight_configured()
+        self._show_spotlight(album, songs, meta, loading=will_fetch)
+        if will_fetch:
+            self._load_spotlight(album, songs)
+
+    @work(exclusive=True, group="spotlight")
+    async def _load_spotlight(self, album: Album, songs: list[Song]) -> None:
+        provider = str(self._setting("ai_provider") or "anthropic")
+        genre = getattr(songs[0], "genre", "") if songs else ""
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None,
+            lambda: aimod.generate_album_spotlight(
+                provider=provider,
+                anthropic_api_key=str(self._setting("anthropic_api_key") or ""),
+                gemini_api_key=str(self._setting("gemini_api_key") or ""),
+                model=str(self._setting("ai_model") or ""),
+                album=album.name,
+                artist=album.artist,
+                year=str(album.year or ""),
+                genre=genre or "",
+            ),
+        )
+        if self.view != "home":
+            return
+        if not data:
+            self._show_spotlight(album, songs, None, failed=True)
+            return
+        self.dirs.write_cache(f"spotlight-{album.id}", data)
+        self._show_spotlight(album, songs, data)
+
+    def _show_spotlight(
+        self, album, songs, meta, *, loading: bool = False, failed: bool = False, hint: str = ""
+    ) -> None:
+        self._songs = list(songs)  # Enter on the Home row plays the album
+        if self._filtering:
+            self._exit_filter()
+        self._clear_selection()
+        panel = self.query_one("#tracks-panel")
+        panel.border_title = "★ album of the day"
+        opts: list[Option] = [Option(Text(""), disabled=True)]
+
+        def line(t: Text) -> None:
+            opts.append(Option(t, disabled=True))
+
+        if album is None:
+            line(Text(f"  {hint or 'nothing to spotlight yet'}", style=palette.dim))
+            self._fill("#tracks-list", opts, "#tracks-panel")
+            return
+
+        title = Text("  ", no_wrap=True, overflow="ellipsis")
+        title.append(album.name, style=f"bold {palette.text}")
+        line(title)
+        sub = Text("  ", no_wrap=True, overflow="ellipsis")
+        sub.append(album.artist or "unknown artist", style=palette.sub)
+        line(sub)
+        m = meta or {}
+        bits = [b for b in (m.get("year") or (str(album.year) if album.year else ""),
+                            m.get("label", ""), m.get("genre", "")) if b]
+        if bits:
+            line(Text("  " + "  ·  ".join(bits), style=palette.dim))
+        line(Text(""))
+        if loading:
+            line(Text(f"  {anim.spinner(0)} loading spotlight…", style=palette.blue))
+        elif m.get("trivia"):
+            for wrapped in textwrap.wrap(m["trivia"], width=56):
+                line(Text("  " + wrapped, style=palette.text))
+        elif failed:
+            line(Text("  couldn't load trivia — check your key in settings", style=palette.faint))
+        elif not self._spotlight_configured():
+            hint_t = Text("  add a Claude or Gemini key in settings (", style=palette.faint)
+            hint_t.append(CONFIG["keybinds"]["settings"], style=palette.blue)
+            hint_t.append(") for trivia", style=palette.faint)
+            line(hint_t)
+        line(Text(""))
+        play = Text("  enter", style=palette.blue)
+        play.append(" on Home plays this album", style=palette.dim)
+        line(play)
+        self._fill("#tracks-list", opts, "#tracks-panel")
+
+    @staticmethod
+    def _reorder_for_artist_diversity(songs: list[Song], last_artist: str) -> list[Song]:
+        """Reorder so the same artist rarely plays back-to-back (greedy: always
+        take the next song whose artist differs from the previous one)."""
+        remaining = list(songs)
+        out: list[Song] = []
+        prev = last_artist
+        while remaining:
+            pick = next((s for s in remaining if s.artist != prev), remaining[0])
+            remaining.remove(pick)
+            out.append(pick)
+            prev = pick.artist
+        return out
 
     def _onboarded(self, config: dict | None) -> None:
         if not config:
@@ -743,12 +1080,16 @@ class NaviTuiApp(KitApp):
             return
         host = self.client.server.split("://", 1)[-1]
         text = Text()
+        if getattr(self, "private_mode", False):
+            text.append("private  ", style=f"bold {palette.mauve}")
         if self._offline:
             text.append(f"{icons.PLUG} offline  ", style=palette.yellow)
         if self.client.max_bitrate:
             # signal glyph + cap, shown only while streaming is capped
             text.append(f"\uf012 {self.client.max_bitrate}k  ", style=palette.yellow)
         text.append(f"{self.client.username}@{host}", style=palette.dim)
+        from navitui import __version__
+        text.append(f"  \u00b7 v{__version__}", style=palette.vfaint)
         self.query_one("#status", Static).update(text)
 
     # ── the heartbeat (all constant animation) ────────────────────────
@@ -803,6 +1144,12 @@ class NaviTuiApp(KitApp):
         if ol.highlighted is not None:
             highlighted_id = ol.get_option_at_index(ol.highlighted).id
         options: list[Option] = []
+        if getattr(self, "_home_enabled", False):
+            home_row = Text(no_wrap=True, overflow="ellipsis")
+            home_row.append("★ ", style=palette.yellow)
+            home_row.append("home", style=palette.text)
+            options.append(Option(home_row, id="home"))
+            options.append(Option(Text(" "), disabled=True))
         options.append(Option(Text(" tracks", style=f"bold {palette.dim}"), disabled=True))
         for view_id, label in VIEWS:
             row = Text(no_wrap=True, overflow="ellipsis")
@@ -926,6 +1273,9 @@ class NaviTuiApp(KitApp):
     @work(exclusive=True, group="songs")
     async def _load_view(self, view_id: str) -> None:
         await asyncio.sleep(0.12)  # superseded while the cursor is moving
+        if view_id == "home":
+            await self._render_home()
+            return
         title = self._tracks_title(view_id)
 
         if view_id in ("all-songs", "shuffle-all"):
@@ -1634,6 +1984,9 @@ class NaviTuiApp(KitApp):
                 batch = []
             have = {s.id for s in self.queue.songs}
             fresh = [s for s in batch if s.id not in have][:20]
+            # avoid long same-artist streaks in the endless station
+            last_artist = self.queue.songs[-1].artist if self.queue.songs else ""
+            fresh = self._reorder_for_artist_diversity(fresh, last_artist)
             if not fresh:
                 if autoplay:  # nothing to add and the queue is empty — stop calmly
                     self.player.stop()
@@ -1686,8 +2039,10 @@ class NaviTuiApp(KitApp):
                 self._scrobbled = True
                 self._scrobble(song, True)
                 # a play is now "counted" — mirror it into the local stats log
-                # (cheap append; never blocks; matches the scrobble moment)
-                self.stats.log_play(song.id, song.title, song.artist)
+                # (cheap append; never blocks; matches the scrobble moment).
+                # Private listening skips the local log too, not just the network.
+                if not getattr(self, "private_mode", False):
+                    self.stats.log_play(song.id, song.title, song.artist)
         # crash-safe resume point, at most every 10s
         if position - self._last_persist >= 10 or position < self._last_persist:
             self._last_persist = position
@@ -1863,25 +2218,21 @@ class NaviTuiApp(KitApp):
             self.notify("highlight a track first (tracks or queue panel)", timeout=3)
             return
         label = songs[0].title if len(songs) == 1 else f"{len(songs)} tracks"
-        options = [
-            Option(Text(f" {icons.LIST} {p.name}", style=palette.text), id=f"pl:{p.id}")
-            for p in self._playlists
-        ]
-        options.append(Option(Text(f" {icons.PLUS} new playlist…", style=palette.sub), id="pl-new"))
+        picklist = [(p.id, p.name) for p in self._playlists]
 
-        def picked(choice: str | None) -> None:
+        def picked(choice: dict | None) -> None:
             if not choice:
                 return
-            if choice == "pl-new":
+            if choice.get("action") == "new":
                 self.push_screen(
                     InputModal("new playlist", placeholder="name"),
                     lambda name: self._playlist_create(name, songs) if name else None,
                 )
-            else:
-                pid = choice.split(":", 1)[1]
-                self._playlist_append(pid, songs)
+            elif choice.get("action") == "add":
+                for pid in choice.get("playlist_ids", []):
+                    self._playlist_append(pid, songs)
 
-        self.push_screen(PickerModal(f"add “{label}” to…", options), picked)
+        self.push_screen(PlaylistPickerModal(picklist, f"add “{label}” to…"), picked)
 
     def _playlist_created_name(self, name: str | None) -> None:
         if name:
@@ -2573,6 +2924,8 @@ class NaviTuiApp(KitApp):
     async def _scrobble(self, song: Song, submission: bool) -> None:
         # best-effort but still worth buffering so play counts catch up; stays
         # silent (background write, no user gesture to acknowledge)
+        if getattr(self, "private_mode", False):
+            return  # private listening: no scrobble, no ListenBrainz, no buffer
         if self._offline:
             self.mutations.scrobble(song.id, submission)
             # ListenBrainz needs full track metadata the offline mutation queue

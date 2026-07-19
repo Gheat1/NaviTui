@@ -67,6 +67,12 @@ KEYBINDS = {
     "theme_cycle":         "t",
     "theme_pick":          "T",
     "zen":                 "z",
+    "equalizer":           "ctrl+e",
+    "audio_device":        "ctrl+o",
+    "server_switch":       "ctrl+g",
+    "pin_toggle":          "ctrl+f",
+    "private_mode":        "ctrl+y",
+    "settings":            "ctrl+n",
     "command_palette":     "ctrl+p",
     "help":                "question_mark",
     "quit":                "q",
@@ -86,6 +92,21 @@ DEFAULTS = {
     "remote_control": True,       # local control API (unix socket) for the CLI/MCP
     "remote_token": "",           # optional shared secret; required on the TCP fallback
     "jukebox": False,             # play on the SERVER's audio out, not this machine
+    "replaygain_preamp": 0.0,     # dB, applied on top of ReplayGain gain
+    "replaygain_fallback": 0.0,   # dB, substitute gain for tracks with no RG tags (-6 tames untagged tracks)
+    "audio_exclusive": False,     # take exclusive/direct control of the output device
+    "pipewire_buffer": 0,         # ms; PipeWire target buffer (0 = mpv default)
+    # 10-band parametric equalizer (31Hz–16kHz). Toggled/edited live from the
+    # in-app overlay; persisted at runtime in app state, seeded from here.
+    "equalizer": {"enabled": False, "preset": "flat", "bands": [0.0] * 10},
+    # Album Spotlight (Home view): a daily album with AI-generated trivia.
+    # Provider + key are usually set from the in-app Settings screen (stored in
+    # app state), but can also be pinned here.
+    "ai_provider": "anthropic",   # "anthropic" (Claude) | "gemini"
+    "anthropic_api_key": "",      # console.anthropic.com — for the Claude provider
+    "gemini_api_key": "",         # aistudio.google.com — for the Gemini provider
+    "ai_model": "",               # override the provider's default model ("" = default)
+    "home_spotlight": True,       # show the Home view with an Album of the Day
 }
 
 _TEMPLATE = """\
@@ -145,6 +166,36 @@ _TEMPLATE = """\
 # refuses. Toggle at runtime with J.
 #jukebox = false
 
+# ReplayGain fine-tuning (in dB). preamp is applied on top of the ReplayGain
+# gain; fallback is the gain substituted for tracks that carry no RG tags.
+#replaygain_preamp = 0.0
+#replaygain_fallback = -6.0
+
+# Take exclusive/direct control of the audio device (bit-perfect-ish output;
+# no other app can use the device while playing). Pair with a raw hw device
+# via the audio-device switcher (see [keybinds]).
+#audio_exclusive = false
+
+# PipeWire target buffer in ms (Linux/PipeWire only; 0 = mpv default). A small
+# value like 150 can smooth Bluetooth playback.
+#pipewire_buffer = 0
+
+# 10-band equalizer. Usually edited live from the in-app overlay (see the
+# `equalizer` keybind); these values seed it. bands are gains in dB, low→high.
+#[equalizer]
+#enabled = false
+#preset = "flat"
+#bands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+# Album Spotlight (Home view) — an Album of the Day with AI-generated trivia.
+# Set the provider and paste a key from the in-app Settings screen, or here.
+# home_spotlight = false hides the Home view entirely.
+#ai_provider = "anthropic"   # "anthropic" (Claude) or "gemini"
+#anthropic_api_key = ""
+#gemini_api_key = ""
+#ai_model = ""                # e.g. "claude-haiku-4-5" or "gemini-2.5-flash"
+#home_spotlight = true
+
 # Remap any key. Action ids and defaults:
 #[keybinds]
 {keybinds}
@@ -167,6 +218,18 @@ def load(config_dir: Path) -> dict:
             for action, keys in value.items():
                 if action in KEYBINDS and isinstance(keys, str) and keys:
                     cfg["keybinds"][action] = keys
+        elif key == "equalizer" and isinstance(value, dict):
+            eq = dict(DEFAULTS["equalizer"])
+            if isinstance(value.get("enabled"), bool):
+                eq["enabled"] = value["enabled"]
+            if isinstance(value.get("preset"), str) and value["preset"]:
+                eq["preset"] = value["preset"]
+            bands = value.get("bands")
+            if isinstance(bands, list) and len(bands) == 10 and all(
+                isinstance(b, (int, float)) for b in bands
+            ):
+                eq["bands"] = [float(b) for b in bands]
+            cfg["equalizer"] = eq
         elif key in DEFAULTS and isinstance(DEFAULTS[key], float) and isinstance(value, (int, float)):
             cfg[key] = float(value)  # accept bare ints for float knobs (crossfade = 2)
         elif key in DEFAULTS and isinstance(value, type(DEFAULTS[key])):
