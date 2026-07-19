@@ -662,7 +662,7 @@ class EqualizerModal(ModalScreen):
                 head.append(f"{icons.bars(3, palette.blue, palette.vfaint)} ")
                 head.append("equalizer", style=f"bold {palette.sub}")
                 yield Static(head, id="eq-title")
-            yield Static(self._render(), id="eq-body")
+            yield Static(self._render_eq(), id="eq-body")
             yield Static(self._hint(), id="eq-hint")
 
     def _slider(self, gain: float, selected: bool) -> Text:
@@ -681,7 +681,8 @@ class EqualizerModal(ModalScreen):
                 bar.append("─", style=palette.vfaint)
         return bar
 
-    def _render(self) -> Text:
+    def _render_eq(self) -> Text:
+        # (named _render_eq, not _render — Widget._render is a real internal)
         out = Text()
         state = "on" if self._enabled else "off"
         state_style = palette.green if self._enabled else palette.faint
@@ -718,7 +719,7 @@ class EqualizerModal(ModalScreen):
 
     def _refresh(self) -> None:
         try:
-            self.query_one("#eq-body", Static).update(self._render())
+            self.query_one("#eq-body", Static).update(self._render_eq())
         except Exception:
             pass
 
