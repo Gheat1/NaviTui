@@ -53,6 +53,10 @@ class Player:
         ao: str | None = None,
         replaygain: str = "album",
         gapless: str = "weak",
+        replaygain_preamp: float = 0.0,
+        replaygain_fallback: float = 0.0,
+        audio_exclusive: bool = False,
+        pipewire_buffer: int = 0,
     ) -> None:
         self._on_position = on_position
         self._on_track_end = on_track_end
@@ -73,8 +77,18 @@ class Player:
         )
         if replaygain in ("album", "track"):
             opts["replaygain"] = replaygain
+            # preamp/fallback only shape the ReplayGain path, so pass them
+            # alongside the mode (mpv ignores them when replaygain is off).
+            opts["replaygain_preamp"] = float(replaygain_preamp)
+            opts["replaygain_fallback"] = float(replaygain_fallback)
         if gapless in ("yes", "weak", "no"):
             opts["gapless_audio"] = gapless
+        if audio_exclusive:
+            opts["audio_exclusive"] = True
+        if pipewire_buffer and pipewire_buffer > 0:
+            # mpv has no "pipewire buffer" knob; --audio-buffer (seconds) is the
+            # real lever. Expose it in ms for convenience.
+            opts["audio_buffer"] = pipewire_buffer / 1000.0
         if ao:
             opts["ao"] = ao
         self._m = _mpv.MPV(**opts)
@@ -286,6 +300,80 @@ class Player:
         self._m.speed = value
         return value
 
+    # ── equalizer ─────────────────────────────────────────────────────
+    # 10 fixed centre frequencies (Hz), low → high.
+    EQ_FREQS = (31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000)
+
+    def set_equalizer(self, gains: list[float]) -> None:
+        """Apply a 10-band parametric EQ as a *labeled* mpv filter (@eq).
+
+        Crucially this uses `af add/remove @eq` rather than assigning `af`
+        wholesale — the loudness meter lives in the same chain as `@nav`, and
+        replacing the chain would silently kill the visualizer. Empty or
+        all-zero gains clear the EQ (removing @eq) and leave @nav intact.
+        """
+        try:
+            self._m.command("af", "remove", "@eq")
+        except Exception:
+            pass  # not present yet — fine
+        if not gains or all(abs(g) < 1e-6 for g in gains):
+            return
+        bands = []
+        for freq, gain in zip(self.EQ_FREQS, gains[:10]):
+            bands.append(f"equalizer=f={freq}:t=q:w=1.0:g={gain}")
+        try:
+            self._m.command("af", "add", f"@eq:lavfi=[{','.join(bands)}]")
+        except Exception:
+            pass  # mpv without the equalizer/lavfi filter — EQ silently off
+
+    # ── output device selection ───────────────────────────────────────
+    def get_audio_devices(self) -> list[dict]:
+        """The output devices mpv can see, de-duplicated by description and
+        with the noisy generic ALSA entries dropped (real hw:/plughw: kept)."""
+        try:
+            raw = self._m.audio_device_list or []
+        except Exception:
+            return []
+        keep_prefixes = ("auto", "pipewire", "pulse", "coreaudio", "wasapi", "alsa")
+        seen: set[str] = set()
+        out: list[dict] = []
+        for dev in raw:
+            name = dev.get("name", "")
+            desc = dev.get("description", "")
+            if name.startswith("alsa/") and not name.startswith(("alsa/hw:", "alsa/plughw:")):
+                continue
+            if not any(name.startswith(p) for p in keep_prefixes):
+                continue
+            if desc in seen:
+                continue
+            seen.add(desc)
+            out.append(dev)
+        return out or raw
+
+    def get_current_audio_device(self) -> str:
+        try:
+            return self._m.audio_device or "auto"
+        except Exception:
+            return "auto"
+
+    def set_audio_device(self, name: str) -> None:
+        """Switch the output device. Normalizes the backend prefix to match the
+        live driver, so a name captured under pipewire/… still resolves when
+        mpv is actually running under pulse/… (common after a driver switch)."""
+        try:
+            ao = self._m.ao
+            if isinstance(ao, list) and ao:
+                ao = ao[0].get("name")
+            if not isinstance(ao, str):
+                ao = ""
+            if ao and "/" in name:
+                prefix, device_id = name.split("/", 1)
+                if prefix != ao and ao in ("pulse", "pipewire", "alsa"):
+                    name = f"{ao}/{device_id}"
+            self._m.audio_device = name
+        except Exception:
+            pass
+
     def terminate(self) -> None:
         self._closing = True  # observers go quiet before the core dies
         self._want_playing = False
@@ -342,6 +430,18 @@ class NullPlayer:
 
     def set_speed(self, value: float) -> float:
         return value
+
+    def set_equalizer(self, gains: list[float]) -> None:
+        pass
+
+    def get_audio_devices(self) -> list[dict]:
+        return []
+
+    def get_current_audio_device(self) -> str:
+        return "auto"
+
+    def set_audio_device(self, name: str) -> None:
+        pass
 
     def terminate(self) -> None:
         pass
