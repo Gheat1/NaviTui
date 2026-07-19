@@ -44,6 +44,8 @@ windows = [
 ]
 # MCP server — control a running NaviTui from Claude Code / any MCP client
 mcp = ["mcp>=1.2"]
+# Album Spotlight (Home view) — AI-generated album trivia via Claude or Gemini
+ai = ["anthropic>=0.40", "google-genai>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/Gheat1/NaviTui"
