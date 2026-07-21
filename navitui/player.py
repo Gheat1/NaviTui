@@ -13,7 +13,37 @@ just tells you how to get sound on your OS.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from typing import Callable
+
+
+def _ensure_libmpv_on_search_path() -> None:
+    """Make Homebrew's libmpv discoverable before `import mpv`.
+
+    python-mpv locates libmpv via `ctypes.util.find_library('mpv')`, which on
+    macOS only searches `~/lib`, `/usr/local/lib`, `/lib` and `/usr/lib`. On
+    Apple Silicon, Homebrew installs libmpv under `/opt/homebrew/lib`, so a
+    perfectly-installed `brew install mpv` is still invisible and playback
+    silently drops to the "libmpv not found" hint. Prepend the Homebrew lib
+    dirs to DYLD_FALLBACK_LIBRARY_PATH (find_library reads it at call time)
+    so both Apple Silicon and Intel prefixes resolve.
+    """
+    if sys.platform != "darwin":
+        return
+    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    parts = existing.split(os.pathsep) if existing else []
+    # /opt/homebrew/lib: Apple Silicon; /usr/local/lib: Intel. The latter is
+    # already a find_library default but harmless to restate — setting the var
+    # replaces the default list, so keep it in.
+    for lib_dir in ("/opt/homebrew/lib", "/usr/local/lib"):
+        if os.path.isdir(lib_dir) and lib_dir not in parts:
+            parts.append(lib_dir)
+    if parts:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(parts)
+
+
+_ensure_libmpv_on_search_path()
 
 MPV_AVAILABLE = True
 MPV_ERROR = ""
