@@ -359,11 +359,31 @@ class Player:
     # ── output device selection ───────────────────────────────────────
     def get_audio_devices(self) -> list[dict]:
         """The output devices mpv can see, de-duplicated by description and
-        with the noisy generic ALSA entries dropped (real hw:/plughw: kept)."""
+        with the noisy generic ALSA entries dropped (real hw:/plughw: kept).
+
+        Enumerated on a short-lived throwaway mpv instance, never on the live
+        player. Reading `audio-device-list` arms mpv's device-hotplug monitor
+        for the whole life of that instance, and on macOS libmpv's CoreAudio
+        hotplug callback can null-deref and segfault the entire process when a
+        device later appears/disappears (seen on mpv 0.41). Probing on a
+        disposable client we terminate right away keeps that monitor off the
+        long-lived playback instance, so a headphone/Bluetooth change mid-
+        session can't take the app down. Switching device (`set_audio_device`,
+        by name) doesn't enumerate, so it stays on the live player.
+        """
+        raw: list[dict] = []
+        probe = None
         try:
-            raw = self._m.audio_device_list or []
+            probe = _mpv.MPV(video=False, terminal=False, idle=True)
+            raw = probe.audio_device_list or []
         except Exception:
-            return []
+            raw = []
+        finally:
+            if probe is not None:
+                try:
+                    probe.terminate()
+                except Exception:
+                    pass
         keep_prefixes = ("auto", "pipewire", "pulse", "coreaudio", "wasapi", "alsa")
         seen: set[str] = set()
         out: list[dict] = []
