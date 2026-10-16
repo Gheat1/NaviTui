@@ -914,8 +914,8 @@ class NaviTuiApp(KitApp):
         # call app actions directly — no thread marshalling
         controls = {
             "play_pause": self.action_play_pause,
-            "play": lambda: (self.player.set_paused(False) if self.player.active else self.action_play_pause()),
-            "pause": lambda: self.player.set_paused(True),
+            "play": self._external_play,
+            "pause": self._external_pause,
             "stop": self._external_stop,
             "next": self.action_next_track,
             "prev": self.action_prev_track,
@@ -1029,6 +1029,17 @@ class NaviTuiApp(KitApp):
         self._persist_queue()
         self._announce()
         return {"queued": True, "title": song.title}
+
+    def _external_play(self) -> None:
+        if self.player.active:
+            self.player.set_paused(False)
+            self._announce()
+        else:
+            self.action_play_pause()
+
+    def _external_pause(self) -> None:
+        self.player.set_paused(True)
+        self._announce()
 
     def _external_stop(self) -> None:
         self.player.stop()
