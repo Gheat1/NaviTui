@@ -42,6 +42,7 @@ from navitui.playqueue import PlayQueue
 from navitui.remote import Remote, build_snapshot
 from navitui.screens import (
     AudioDeviceSwitcherModal,
+    BookmarkPickerModal,
     EqualizerModal,
     InputModal,
     LyricsModal,
@@ -61,8 +62,6 @@ from navitui.widgets import ClickList, Logo, NowPlaying, PAUSE_GLYPH, PLAY_GLYPH
 # remapping a key is an edit to player.toml + restart
 CONFIG = configmod.load(AppDirs("navitui").config_file.parent)
 
-# nf-fa-bookmark — as a \uXXXX escape (raw PUA glyphs don't survive patching)
-BOOKMARK_GLYPH = "\uf02e"
 
 # nerd-font glyphs kept as \uXXXX escapes (raw PUA does not survive patch
 # tooling): nf-fa-podcast + nf-fa-broadcast_tower for the two new sections
@@ -2699,47 +2698,33 @@ class NaviTuiApp(KitApp):
         if not marks:
             self.notify("no bookmarks yet — press w while playing", timeout=3)
             return
-        options = []
-        for i, m in enumerate(marks):
-            row = Text.assemble(
-                (f" {BOOKMARK_GLYPH} ", palette.peach),
-                (m.song.title, palette.text),
-                (f"  {m.song.artist}", palette.dim),
-                (f"  @ {anim.fmt_time(m.position_ms // 1000)}", palette.vfaint),
-            )
-            options.append(Option(row, id=str(i)))
-        self._pending_bookmarks = marks
-        self.push_screen(PickerModal("resume a bookmark", options), self._bookmark_picked)
+        self.push_screen(BookmarkPickerModal(marks), self._bookmark_picked)
 
-    def _bookmark_picked(self, index: str | None) -> None:
-        if index is None:
-            return
-        marks = getattr(self, "_pending_bookmarks", [])
-        try:
-            mark = marks[int(index)]
-        except (ValueError, IndexError):
+    def _bookmark_picked(self, mark: Bookmark | None) -> None:
+        if mark is None:
             return
         # play the bookmarked song solo, seeking straight to the saved point
         self.queue.set_songs([mark.song], 0)
         self._play_current(resume_at=mark.position_ms / 1000.0)
 
-    def action_toggle_notifications(self) -> None:
-        on_now = self.notifier.toggle()
-        self.notify(f"notifications {'on' if on_now else 'off'}", timeout=2)
+        def action_toggle_notifications(self) -> None:
+            on_now = self.notifier.toggle()
+            self.notify(f"notifications {'on' if on_now else 'off'}", timeout=2)
 
-    def action_queue_move(self, delta: int) -> None:
-        focused = self.focused
-        if focused is None or focused.id != "queue-list":
-            return
-        ol = self.query_one("#queue-list", NavList)
-        if ol.highlighted is None:
-            return
-        new = self.queue.move(ol.highlighted, delta)
-        if new is None:
-            return
-        self._render_queue()
-        ol.highlighted = new
-        self._persist_queue()
+        def action_queue_move(self, delta: int) -> None:
+            focused = self.focused
+            if focused is None or focused.id != "queue-list":
+                return
+            ol = self.query_one("#queue-list", NavList)
+            if ol.highlighted is None:
+                return
+            new = self.queue.move(ol.highlighted, delta)
+            if new is None:
+                return
+            self._render_queue()
+            ol.highlighted = new
+            self._persist_queue()
+
 
     # ── offline mutation queue ────────────────────────────────────────
     @staticmethod

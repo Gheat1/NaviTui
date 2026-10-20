@@ -21,8 +21,11 @@ from ricekit.widgets import NavList, pop_in
 
 from navitui import anim, stats as statsmod
 from navitui.api import SubsonicError, make_token, normalize_server
-from navitui.models import SearchResults
+from navitui.models import Bookmark, SearchResults
 from navitui.widgets import Logo, Visualizer
+
+
+BOOKMARK_GLYPH = "\uf02e"  # nf-fa-bookmark
 
 
 def settle_pop_in(screen, box_selector: str) -> None:
@@ -1122,6 +1125,134 @@ class SettingsModal(ModalScreen):
                 "home_spotlight": self._home,
             }
         )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+
+class BookmarkPickerModal(ModalScreen):
+    """Pick a saved bookmark to resume, or delete it with x.
+
+    Dismisses with the chosen Bookmark (resume), or None on escape. Deletion
+    is handled in-place (x on the highlighted row): the client call runs on a
+    worker, the cache is invalidated, and the list rebuilds so a cleanup pass
+    can delete several without reopening the picker.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", show=False),
+        Binding("x", "delete_bookmark", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    BookmarkPickerModal { align: center middle; background: $kit-overlay; }
+    BookmarkPickerModal #bm-box {
+        width: 68; height: auto; max-height: 80%;
+        background: $kit-modal-bg; border: round $kit-border-focus; padding: 1 2;
+    }
+    BookmarkPickerModal Static { background: $kit-modal-bg; }
+    BookmarkPickerModal #bm-list { height: auto; max-height: 20; }
+    """
+
+    def __init__(self, bookmarks: list[Bookmark]) -> None:
+        super().__init__()
+        self._bookmarks = list(bookmarks)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bm-box"):
+            head = Text()
+            head.append(f"{BOOKMARK_GLYPH} ", style=palette.peach)
+            head.append("bookmarks", style=f"bold {palette.sub}")
+            yield Static(head)
+            yield NavList(id="bm-list")
+            yield Static(self._hint(), id="bm-hint")
+
+    def _hint(self) -> Text:
+        t = Text("\n")
+        for i, (key, desc) in enumerate(
+            [("enter", "resume"), ("x", "delete"), ("esc", "close")]
+        ):
+            if i:
+                t.append("  ·  ", style=palette.vfaint)
+            t.append(key, style=palette.blue)
+            t.append(f" {desc}", style=palette.dim)
+        return t
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#bm-box"))
+        settle_pop_in(self, "#bm-box")
+        self._rebuild()
+        self.query_one("#bm-list", NavList).focus()
+
+    def _rebuild(self) -> None:
+        ol = self.query_one("#bm-list", NavList)
+        keep = ol.highlighted
+        had_focus = ol.has_focus
+        ol.clear_options()
+        opts: list[Option] = []
+        for i, m in enumerate(self._bookmarks):
+            row = Text.assemble(
+                (f" {BOOKMARK_GLYPH} ", palette.peach),
+                (m.song.title, palette.text),
+                (f"  {m.song.artist}", palette.dim),
+                (f"  @ {anim.fmt_time(m.position_ms // 1000)}", palette.vfaint),
+            )
+            opts.append(Option(row, id=str(i)))
+        if not opts:
+            opts.append(Option(Text("  no bookmarks left", style=palette.dim), disabled=True))
+        ol.add_options(opts)
+        if self._bookmarks:
+            ol.highlighted = min(keep, len(self._bookmarks) - 1) if keep is not None else 0
+        if had_focus:
+            ol.focus()
+
+    def _highlighted(self) -> Bookmark | None:
+        ol = self.query_one("#bm-list", NavList)
+        if ol.highlighted is None or not self._bookmarks:
+            return None
+        try:
+            return self._bookmarks[ol.highlighted]
+        except IndexError:
+            return None
+
+    @on(OptionList.OptionSelected, "#bm-list")
+    def _selected(self, event: OptionList.OptionSelected) -> None:
+        bm = self._highlighted()
+        if bm is not None:
+            self.dismiss(bm)
+
+    def action_delete_bookmark(self) -> None:
+        bm = self._highlighted()
+        if bm is not None:
+            self._do_delete(bm)
+
+    @work
+    async def _do_delete(self, bm: Bookmark) -> None:
+        app = self.app
+        if getattr(app, "client", None) is None:
+            self.notify("not connected", severity="warning", timeout=3)
+            return
+        try:
+            idx = self._bookmarks.index(bm)
+        except ValueError:
+            return  # already gone (rapid double-tap)
+        # optimistic remove, restore on failure so the row reappears in place
+        self._bookmarks.pop(idx)
+        self._rebuild()
+        try:
+            await app.client.delete_bookmark(bm.song.id)
+        except Exception as e:
+            self._bookmarks.insert(idx, bm)
+            self._rebuild()
+            self.notify(f"couldn't delete bookmark: {e}", severity="warning", timeout=5)
+            return
+        # invalidate the app's bookmark cache so the next W re-fetches fresh
+        try:
+            app.dirs.cache_dir.joinpath("bookmarks.json").unlink()
+        except OSError:
+            pass
+        self.notify(f"removed bookmark for {bm.song.title}", timeout=2)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
